@@ -1,0 +1,317 @@
+# Bayesian Astro Stacker — TODO
+
+Status markers:
+- ✅ Done
+- 🔧 In progress
+- 🔲 Planned — design agreed, ready to implement
+- 💡 Explore — idea worth investigating, needs more thought
+- 📖 Research — open theoretical question
+
+---
+
+## Phase 0 — Instrument calibration model
+
+### ✅ Done
+
+- [x] `WelfordAccumulator` — online mean + variance, numerically stable
+- [x] `LinearRegressionAccumulator` — online per-pixel linear regression
+      using Welford-centred bivariate formulation (eliminates catastrophic
+      cancellation in slope and residual SS)
+- [x] `InstrumentModel` dataclass with fields for all calibration outputs
+- [x] `fit_bias` — Welford streaming fit, produces `bias_mean`, `read_noise`
+- [x] `fit_dark` — streaming linear regression, produces `dark_rate`,
+      `hot_pixel_mask` via MAD-based threshold
+- [x] `fit_flat` — Welford streaming fit with per-channel Bayer normalisation
+      for OSC cameras; produces `flat_gain`, `flat_uncertainty`
+- [x] `fit_dark_flat` — Welford mean of residuals, produces `amp_glow_profile`
+- [x] `fit_all` — top-level entry point, discovers frames by subfolder name
+      or FITS `IMAGETYP` header keyword
+- [x] `calibrate_frame` — applies bias/dark/flat corrections to a raw frame
+- [x] `validate` — sanity checks with logged warnings
+- [x] `is_compatible` — checks shape, gain, temperature before cross-session reuse
+- [x] HDF5 serialization — `save` / `load` round-trip
+- [x] Auto chunk sizing from available RAM via `psutil`
+- [x] OSC Bayer pattern detection from FITS header (`BAYERPAT`, `COLORTYP`)
+- [x] Scope geometry fields as placeholders:
+      `aperture_mm`, `focal_length_mm`, `central_obstruction`, `pixel_size_um`
+- [x] PSF placeholder fields:
+      `psf_diffraction` (None), `psf_optics` (None), `position_angle_deg` (None)
+
+---
+
+## Phase 0b — Bayesian prior hierarchy for calibration (`bayes_calibration.py`)
+
+### ✅ Done
+
+- [x] `SensorPriors` dataclass — published sensor spec defaults with factory
+      `for_asi533_gain100()` (read noise 6 ADU, dark 0.002 ADU/s at -10°C)
+- [x] `BiasPriorAccumulator` — Gaussian-Gaussian conjugate in information
+      (precision) form; streaming update per frame; prior_mean + prior_variance
+- [x] `ReadNoisePriorAccumulator` — InverseGamma conjugate; accumulates
+      α += 0.5 and β += 0.5·(x-μ)² per frame; Choi-Wette initialised
+- [x] `DarkRatePriorAccumulator` — Gamma-Poisson conjugate; accumulates
+      α += x_counts and β += exposure_s per frame; prior initialised from
+      sensor spec rate and concentration
+- [x] `FlatGainPriorAccumulator` — Gaussian conjugate in precision form;
+      accounts for Poisson shot noise + read noise in likelihood variance;
+      prior mean ALWAYS reset to 1.0 on new session (gain mean is not reusable),
+      prior variance (pixel-to-pixel gain structure) carries over
+- [x] `dark_rate_temperature_correction()` — Arrhenius scaling for silicon;
+      E_g = 1.12 eV; round-trip A→B→A = identity to 1e-6 relative
+- [x] `DarkRatePriorAccumulator.temperature_correct()` — scales α in-place
+      (β stays in seconds); updates ref_temp_c
+- [x] `BayesCalibrationState` — container for all four accumulators with
+      point-estimate properties (bias_mean, read_noise, dark_rate, flat_gain)
+- [x] `BayesCalibrationState.from_priors()` — construct all four accumulators
+      from SensorPriors; logs prior parameters
+- [x] HDF5 serialization under `/bayes/` group — appends to same file as
+      InstrumentModel; stores full posterior params (α,β or μ,τ²), not
+      just point estimates; lossless cross-session accumulation
+- [x] `BayesCalibrationState.load(new_session=True, new_temp_c=...)` —
+      resets frame counts, resets flat gain mean, temperature-corrects dark prior
+- [x] `BayesCalibrationState.load(new_session=False)` — resume interrupted
+      session: all counts and posteriors preserved unchanged
+- [x] `BayesCalibrationState.summary()` — prints posterior median + n for all
+      four parameters
+
+### 🔲 Planned
+
+- [ ] `fit_all(folder, prior=BayesCalibrationState)` integration — wire
+      BayesCalibrationState into InstrumentModel.fit_all() as optional prior
+- [ ] Temporal decay for hot pixel priors across sessions:
+      α_prior_new = 1 + ρ·(α_post_old - 1); integrate with DarkMixtureModel
+
+---
+
+## Phase 0c — Hot / cold pixel mixture model (`dark_mixture.py`)
+
+### ✅ Done
+
+- [x] `fit_dark_mixture()` — EM algorithm for 3-component Gamma mixture on
+      dark_rate[H,W]; Choi-Wette + Newton-Raphson shape MLE per M-step;
+      log-sum-exp stabilised E-step; component ordering enforced (hot > normal > cold)
+- [x] `_gamma_shape_mle()` — Choi-Wette (1994) closed-form initial estimate
+      followed by Newton-Raphson refinement using analytic trigamma
+- [x] `_trigamma()` — recurrence + asymptotic expansion; accurate and fast
+- [x] Initialisation from sensor mean rate: normal centred on spec,
+      hot=10×, cold=0.1×; normal given higher initial concentration (α=5)
+- [x] Convergence: relative ΔLL < tol; converges in 3–8 iterations in practice
+- [x] `DarkMixtureModel` dataclass — pi[3], alpha[3], beta[3],
+      class_probs[H,W,3], labels[H,W], log_likelihood_curve, normal_threshold
+- [x] `pixel_weight_map()` — returns p_normal[H,W] as continuous reliability
+      weight for the MAP stacker; no hard threshold
+- [x] `calibrate_frame()` — returns both:
+      (1) interpolated frame: hot/cold pixels replaced by neighbour-weighted
+          average (neighbours weighted by their own p_normal);
+      (2) weight_map: p_normal per pixel for MAP stacker
+- [x] HDF5 serialization under `/dark_mixture/` group
+- [x] Recovery of 336/338 true hot pixels (99.4%) on 256×256 synthetic data
+      with π_hot=0.005
+- [x] Edge case: all-normal dark map → π_normal > 0.95, n_hot=n_cold=0
+
+---
+
+## Phase 1 — Instrument PSF characterisation (`optics.py`)
+
+### ✅ Done
+
+- [x] Placeholder fields for all PSF components in `InstrumentModel`
+- [x] Three-component PSF decomposition design:
+      `H_total = H_diff * H_optics * H_seeing`
+- [x] `ScopeGeometry` dataclass — aperture, focal length, pixel size,
+      central obstruction, effective wavelength; computes plate scale
+      and Airy radius as properties
+- [x] `compute_airy_psf()` — exact scalar diffraction formula via Bessel J₁;
+      handles unobstructed and annular (obstructed) apertures; normalised to
+      sum = 1.0; accepts plate scale override from WCS measurement
+- [x] `compute_broadband_psf()` — integrates Airy over a wavelength grid
+      weighted by QE × filter transmission curve
+- [x] `get_instrument_psf()` — returns H_diff alone when psf_optics=None,
+      H_diff * H_optics (FFT convolution) when optical aberration PSF available
+- [x] `WCSGeometry` dataclass — position angle, plate scale, flip state,
+      field centre RA/Dec, full WCS object
+- [x] `extract_wcs_geometry()` — parses CD matrix (preferred), falls back to
+      CDELT/CROTA2 and astropy pixel_scale_matrix; correct PA formula
+      `atan2(CD1_2, CD2_2)`; supports all standard plate-solve header formats
+- [x] `FrameShift` dataclass — sub-pixel dx/dy in pixels and arcsec,
+      rotation angle, scale ratio between frames
+- [x] `compute_frame_shift()` — derives sub-pixel shift + rotation + scale
+      ratio between two WCS solutions using three test points; CRPIX-based
+      shift model (correct); verified against known offsets to < 0.05 px
+- [x] `ASTAPSolver` — subprocess wrapper for ASTAP plate solver with RA/Dec
+      hint extraction from FITS header (handles HMS strings, degrees, hours);
+      `solve()` invokes ASTAP and reads back updated header; `solve_from_header()`
+      extracts WCS from already-solved frames without re-running ASTAP
+- [x] PA convention documented and tested: 0° = North up, 90° = East up,
+      verified at 0°/45°/90°/180°/270° against synthetic CD matrix headers
+
+### 🔲 Provision only — not implementing soon
+
+- [ ] `psf_optics[grid_y, grid_x, K, K]` — spatially varying optical
+      aberration PSF estimated from artificial star or lucky imaging data
+- [ ] 3×3 or 5×5 spatial grid of PSF estimates across sensor
+- [ ] Bicubic interpolation of PSF grid between grid points
+- [ ] Isolation of H_optics by deconvolving H_diff from best-seeing empirical PSFs
+
+---
+
+## Phase 2 — Frame characterisation (`FrameCharacterizer`)
+
+### 🔲 Planned
+
+- [ ] `FrameCharacterizer` class — processes one light frame at a time
+- [ ] ASTAP plate solve per frame → WCS solution
+- [ ] Sub-pixel shift $W_i$ from WCS difference to reference frame
+      (more accurate than mount encoder dither commands)
+- [ ] Transparency $t_i$ from median stellar flux relative to reference frame
+- [ ] Per-frame PSF fitting:
+      - Extract 10–20 isolated unsaturated star stamps
+      - Align stamps to sub-pixel centroid
+      - Stack stamps → empirical $H_{\text{total},i}$
+      - Fit Moffat profile: $H_\text{total}(r) = (\beta-1)/(\pi\alpha^2)(1 + r^2/\alpha^2)^{-\beta}$
+      - Divide out instrument PSF → $H_{\text{seeing},i}$
+      - Record FWHM$_i$ and $\beta_i$ as quality metrics
+- [ ] Sky background estimation — 2D polynomial fit to source-masked pixels
+- [ ] Per-frame quality score: FWHM, transparency, estimated SNR
+- [ ] Output sufficient statistics for stacker accumulation:
+      `shift`, `transparency`, `psf_kernel`, `sky_background` per frame
+
+---
+
+## Phase 3 — Bayesian sufficient statistics accumulation
+
+### 🔲 Planned
+
+- [ ] Streaming accumulator for stacker sufficient statistics:
+      `weighted_sum[H,W]` = Σ $t_i x_i$,  `weight_sum[H,W]` = Σ $t_i$
+- [ ] Accumulate on GPU (PyTorch) for speed
+- [ ] Gamma-Poisson posterior mean as fast stacking baseline:
+      $\hat{\lambda}^{(p)} = (\alpha^{(p)} + \sum_i x_i^{(p)}) / (\beta^{(p)} + n)$
+- [ ] Reference PSF — weighted average of per-frame PSFs by $t_i$
+- [ ] Frame metadata store — shifts, transparencies, PSF kernels, FWHMs
+
+---
+
+## Phase 4 — Joint MAP optimisation (stacker core)
+
+### 🔲 Planned
+
+- [ ] PyTorch MAP optimiser on HR grid (2× super-resolution)
+- [ ] Forward model: $t_i \cdot \text{FFT-conv}(H_i, W_i[\lambda])$ per frame
+- [ ] Poisson negative log-likelihood loss
+- [ ] Total Variation spatial prior with tunable weight $\alpha$
+- [ ] Gamma-Poisson KL prior term with tunable weight $\beta$
+- [ ] Adam optimiser, 100–300 iterations, ~5–15s on GPU for 9M pixels
+- [ ] Non-negativity constraint: `lambda_.data.clamp_(min=0)` after each step
+- [ ] Convergence monitoring — loss curve, FWHM of residuals
+- [ ] Output: HR stacked image + per-pixel uncertainty map
+- [ ] Batch processing: accumulate sufficient statistics frame-by-frame,
+      never hold all frames in GPU memory simultaneously
+
+### 🔲 Sub-pixel shift operators
+
+- [ ] Bilinear interpolation shift operator $W_i$ in Fourier domain
+      (phase shift theorem: shift by $(dx, dy)$ = multiply by
+      $e^{-2\pi i (f_x dx + f_y dy)}$)
+- [ ] OSC Bayer sub-pixel offsets — built-in diversity within each frame
+      from R/G/B channel positions (no dithering required for some SR)
+- [ ] Dither-based SR: use WCS-derived $W_i$ between frames
+
+---
+
+## Phase 5 — Validation and testing
+
+### 🔲 Planned
+
+- [ ] Synthetic data generator for end-to-end tests:
+      - Simulate true HR scene
+      - Apply PSF convolution, pixel sampling, Poisson noise, read noise
+      - Verify stacker recovers scene within expected uncertainty
+- [ ] Compare output vs PixInsight ImageIntegration on same data
+- [ ] Compare output vs simple arithmetic mean (should be strictly better)
+- [ ] PSF estimation accuracy test: inject known PSF, verify recovery
+- [ ] Super-resolution test: verify spatial frequency content above
+      native pixel Nyquist in output
+- [ ] Memory profiling: verify peak RAM stays within budget for 50-frame
+      ASI533 session
+
+---
+
+## 💡 Ideas worth exploring
+
+- **Uncertainty image output** — the MAP optimisation can produce a
+  per-pixel posterior variance map alongside the stacked image.
+  Could be used to flag regions of low confidence (few frames, bad seeing)
+
+- **Adaptive TV weight** — instead of a fixed $\alpha$ for Total Variation,
+  make it spatially varying: lower regularisation in bright nebula regions
+  (high SNR, trust the data), higher in faint background (low SNR, trust
+  the prior). Could be derived from the local SNR estimate.
+
+- **Frame weighting by FWHM not just transparency** — a frame with excellent
+  seeing but thin cloud contributes differently to SR vs background SNR.
+  Decouple the PSF contribution from the flux contribution in the weighting.
+
+- **Deep image prior** — use an untrained CNN as an implicit prior on the
+  scene instead of TV. Has shown strong results for deconvolution in other
+  domains. Would require PyTorch and significantly more computation but
+  no training data needed.
+
+- **Incremental / online stacker** — update the MAP solution as new frames
+  arrive without re-running the full optimisation. Warm-start from previous
+  solution. Enables live preview during an imaging session.
+
+- **Multi-wavelength joint deconvolution** — for broadband data, the PSF
+  is wavelength-dependent (the Airy disk is larger at longer wavelengths,
+  seeing FWHM is smaller). A joint model over wavelength channels could
+  improve colour fidelity near the diffraction limit.
+
+- **Satellite / aircraft trail rejection** — model the data as a mixture:
+  each pixel in each frame is either on-trail (very high count, uniform
+  prior) or off-trail (Poisson sky). The posterior probability of being
+  on-trail gives a soft mask. More principled than streak detection + masking.
+
+---
+
+## 📖 Research questions
+
+- **Poisson-Gaussian convolution** — the calibrated frame distribution is
+  $\text{Poisson}(\lambda) * \mathcal{N}(0, \sigma_r^2)$, not pure Poisson.
+  The conjugate trick breaks down. How much does the pure Poisson approximation
+  cost in practice for typical ASI533 parameters? At what sub-exposure length
+  does read noise become non-negligible at the stacking level?
+
+- **Optimal SR scale factor** — theory says SR is possible up to the
+  diffraction cutoff. In practice noise limits how far you can push it.
+  For the Esprit 100ED + ASI533 setup with typical seeing (3–4") and
+  typical total integration (5–10 hours), what SR factor is actually
+  supported by the data SNR?
+
+- **PSF variability within a session** — seeing changes on timescales of
+  minutes. Is a single per-frame PSF estimate (from stars at the start or
+  end of the sub-exposure) a good approximation, or does intra-frame PSF
+  variation matter? Relevant for sub-exposures longer than ~60s in poor seeing.
+
+- **Moffat vs von Kármán seeing model** — the Moffat profile is an empirical
+  fit. The von Kármán turbulence spectrum gives a theoretically motivated
+  PSF. Does fitting a physically motivated model improve PSF estimation
+  accuracy for the $H_\text{seeing}$ separation step?
+
+- **Conjugate prior for the flat gain** — flat gain is currently treated as
+  a point estimate. A full Bayesian treatment would place a prior on $g^{(p)}$
+  and propagate its uncertainty through to the stacked image. What prior is
+  most appropriate? LogNormal (positivity, multiplicative structure)? How
+  much does flat uncertainty actually matter for a well-exposed master flat?
+
+- **Field rotation for equatorial mounts** — assumed zero but not exactly
+  zero due to polar alignment error. For long sessions on targets near the
+  meridian, residual field rotation can be measurable. Should the shift
+  operator $W_i$ be extended to include a small rotation term, or is pure
+  translation sufficient?
+
+- **Spatially varying PSF in the MAP optimisation** — the current design
+  uses a single PSF per frame. The optics PSF varies across the field.
+  Can the MAP be formulated efficiently with a spatially varying PSF
+  without losing the FFT-based $O(N \log N)$ convolution advantage?
+  Sectored SVD decomposition of the PSF is one approach — worth understanding
+  its computational cost for 9M pixels.
