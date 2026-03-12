@@ -287,13 +287,13 @@ class PipelineResult:
                 "",
                 "  Phase 4 MAP result:",
                 f"    HR shape      : {r.lambda_hr.shape}",
-                f"    Scale factor  : {r.config.scale_factor}×",
+                f"    Scale factor  : {r.config.scale_factor}x",
                 f"    Iterations    : {r.n_iter} / {r.config.n_iter}",
                 f"    Converged     : {r.converged}",
                 f"    Final loss    : {r.loss_history[-1]:.4e}"
                               if r.loss_history else "    Final loss    : n/a",
                 f"    Device        : {r.device}",
-                f"    λ range       : [{r.lambda_hr.min():.1f},"
+                f"    lambda range  : [{r.lambda_hr.min():.1f},"
                                     f" {r.lambda_hr.max():.1f}] ADU",
             ]
         else:
@@ -525,8 +525,9 @@ class BayesianAstroStacker:
             paths = _collect_fits(flat_dir)
             dflat_paths = _collect_fits(dflat_dir) if dflat_dir and \
                           Path(dflat_dir).exists() else None
-            model.fit_flat(paths, dark_flat_paths=dflat_paths,
-                           bayes_state=bayes_state)
+            model.fit_flat(paths, bayes_state=bayes_state)
+            if dflat_paths:
+                model.fit_dark_flat(dflat_paths)
 
         # Fit dark mixture (Phase 0c) if dark was fitted
         if model.dark_rate is not None:

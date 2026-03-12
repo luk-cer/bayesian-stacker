@@ -745,12 +745,18 @@ class BayesCalibrationState:
     def from_priors(
         cls,
         priors: SensorPriors,
-        shape:  Tuple[int, int],
+        shape:  Optional[Tuple[int, int]],
     ) -> "BayesCalibrationState":
         """
         Initialise all four accumulators from sensor spec priors.
         Call this for the very first session with a new sensor.
+
+        When shape=None the accumulators are deferred; call
+        ensure_initialized(shape) once the first calibration frame has been
+        loaded and its shape is known.
         """
+        if shape is None:
+            return cls(shape=None, priors=priors)
         H, W = shape
         c = priors.read_noise_concentration
         sigma2_prior = priors.read_noise_adu ** 2
@@ -790,6 +796,21 @@ class BayesCalibrationState:
             priors         = priors,
         )
 
+    def ensure_initialized(self, shape: Tuple[int, int]) -> None:
+        """
+        Lazily build accumulators from stored priors the first time a
+        calibration frame shape is known.  No-op if already initialised
+        or if no priors are stored.
+        """
+        if self.bias_acc is not None or self.priors is None:
+            return
+        initialised = self.__class__.from_priors(self.priors, shape)
+        self.bias_acc       = initialised.bias_acc
+        self.read_noise_acc = initialised.read_noise_acc
+        self.dark_acc       = initialised.dark_acc
+        self.flat_acc       = initialised.flat_acc
+        self.shape          = shape
+
     # ---- Serialization ----------------------------------------------------
 
     def save(self, path: str | Path) -> None:
@@ -801,13 +822,13 @@ class BayesCalibrationState:
             if "bayes" in f:
                 del f["bayes"]
             g = f.require_group("bayes")
-            if self.bias_acc is not None:
+            if self.bias_acc is not None and self.bias_acc.n > 0:
                 self.bias_acc.to_hdf5(g.require_group("bias"))
-            if self.read_noise_acc is not None:
+            if self.read_noise_acc is not None and self.read_noise_acc.n > 0:
                 self.read_noise_acc.to_hdf5(g.require_group("read_noise"))
-            if self.dark_acc is not None:
+            if self.dark_acc is not None and self.dark_acc.n > 0:
                 self.dark_acc.to_hdf5(g.require_group("dark"))
-            if self.flat_acc is not None:
+            if self.flat_acc is not None and self.flat_acc.n > 0:
                 self.flat_acc.to_hdf5(g.require_group("flat"))
             if self.shape is not None:
                 g.attrs["shape"] = list(self.shape)

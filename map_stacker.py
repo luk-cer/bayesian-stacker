@@ -295,7 +295,7 @@ class MapResult:
             "MapResult",
             "=" * 52,
             f"  HR shape      : {self.lambda_hr.shape}",
-            f"  scale_factor  : {self.config.scale_factor}×",
+            f"  scale_factor  : {self.config.scale_factor}x",
             f"  mode          : {self.config.mode}",
             f"  iterations    : {self.n_iter} / {self.config.n_iter}",
             f"  converged     : {self.converged}",
@@ -303,7 +303,7 @@ class MapResult:
                           if self.loss_history else "  final loss    : n/a",
             f"  device        : {self.device}",
             f"  elapsed       : {self.elapsed_s:.1f} s",
-            f"  λ range       : [{float(self.lambda_hr.min()):.2f},"
+            f"  lambda range  : [{float(self.lambda_hr.min()):.2f},"
                                f" {float(self.lambda_hr.max()):.2f}] ADU",
             "=" * 52,
         ])
@@ -378,7 +378,7 @@ class MapResult:
         ax2.grid(True, alpha=0.3)
 
         fig.suptitle(
-            f"MAP stacker — scale={self.config.scale_factor}×  "
+            f"MAP stacker — scale={self.config.scale_factor}x  "
             f"mode={self.config.mode}  iters={self.n_iter}",
             fontsize=11,
         )
@@ -765,7 +765,7 @@ def _solve_fast(
     pW = _next_power_of_2(sW + psf_arr.shape[0])
 
     psf_spec    = _make_psf_spectrum(psf_arr, pH, pW, dev)   # cached
-    zero_ramp   = _build_phase_ramp(0.0, 0.0, sH, sW, S, dev)  # no shift
+    zero_ramp   = _build_phase_ramp(0.0, 0.0, pH, pW, S, dev)  # no shift
 
     # ---- Optimiser + scheduler --------------------------------------------
     opt  = torch.optim.Adam([theta], lr=config.lr)
@@ -884,28 +884,20 @@ def _solve_exact(
     psf_specs: List["torch.Tensor"]  = []
     phase_ramps: List["torch.Tensor"] = []
 
+    # All PSFs use the same padding for simplicity — use the max
+    psf_max = max(p.shape[0] for p in stats.psf_list)
+    pH = _next_power_of_2(sH + psf_max)
+    pW = _next_power_of_2(sW + psf_max)
+
     for i in range(N):
         psf = stats.psf_list[i].astype(np.float32)
         psf /= psf.sum()
-        pH = _next_power_of_2(sH + psf.shape[0])
-        pW = _next_power_of_2(sW + psf.shape[0])
         psf_specs.append(_make_psf_spectrum(psf, pH, pW, dev))
 
         sh = stats.shift_list[i]
         dx = sh.dx_px if sh is not None else 0.0
         dy = sh.dy_px if sh is not None else 0.0
-        phase_ramps.append(_build_phase_ramp(dx, dy, sH, sW, S, dev))
-
-    # All PSFs use the same padding for simplicity — use the max
-    psf_max = max(p.shape[0] for p in stats.psf_list)
-    pH = _next_power_of_2(sH + psf_max)
-    pW = _next_power_of_2(sW + psf_max)
-    # Recompute spectra with consistent padding
-    psf_specs = []
-    for i in range(N):
-        psf = stats.psf_list[i].astype(np.float32)
-        psf /= psf.sum()
-        psf_specs.append(_make_psf_spectrum(psf, pH, pW, dev))
+        phase_ramps.append(_build_phase_ramp(dx, dy, pH, pW, S, dev))
 
     opt   = torch.optim.Adam([theta], lr=config.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -1061,7 +1053,7 @@ def solve(
 
     dev = _get_device(config.device)
     logger.info(
-        "MAP stacker: mode=%s  scale=%d×  device=%s  n_iter=%d",
+        "MAP stacker: mode=%s  scale=%dx  device=%s  n_iter=%d",
         config.mode, config.scale_factor, dev, config.n_iter,
     )
 

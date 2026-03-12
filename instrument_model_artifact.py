@@ -535,15 +535,12 @@ class InstrumentModel:
         logger.info("fit_bias: %d frames  (bayes=%s)", len(paths), bayes_state is not None)
         cs = self._resolve_chunk_size(chunk_size, paths)
 
-        if bayes_state is not None and bayes_state.bias_acc is not None:
+        if bayes_state is not None and (bayes_state.bias_acc is not None
+                                        or bayes_state.priors is not None):
             # --- Bayesian path ---
-            bias_acc = bayes_state.bias_acc
-            rn_acc   = bayes_state.read_noise_acc
-
-            # Read noise is unknown at start of session; use prior mean as init
-            rn_init = (rn_acc.posterior_mean_std
-                       if rn_acc is not None
-                       else np.full(self.frame_shape or (1,1), 6.0, dtype=np.float64))
+            bias_acc = None   # resolved after lazy init on the first frame
+            rn_acc   = None
+            rn_init  = None
 
             for chunk in _iter_chunks(paths, cs):
                 for path in chunk:
@@ -551,6 +548,15 @@ class InstrumentModel:
                         frame, header = _load_frame(path)
                         self._check_or_set_shape(frame.shape[-2:], "bias")
                         self._update_meta_from_header(header)
+                        bayes_state.ensure_initialized(frame.shape[-2:])
+                        if bias_acc is None:
+                            bias_acc = bayes_state.bias_acc
+                            rn_acc   = bayes_state.read_noise_acc
+                            # Read noise unknown at session start; use prior mean
+                            rn_init = (rn_acc.posterior_mean_std
+                                       if rn_acc is not None
+                                       else np.full(frame.shape[-2:], 6.0,
+                                                    dtype=np.float64))
                         f = frame.squeeze().astype(np.float64)
                         bias_acc.update(f, rn_init)
                         if rn_acc is not None:
@@ -632,9 +638,10 @@ class InstrumentModel:
         cs = self._resolve_chunk_size(chunk_size, paths)
         n  = 0
 
-        if bayes_state is not None and bayes_state.dark_acc is not None:
+        if bayes_state is not None and (bayes_state.dark_acc is not None
+                                        or bayes_state.priors is not None):
             # --- Bayesian path: Gamma-Poisson conjugate ---
-            dk_acc = bayes_state.dark_acc
+            dk_acc = None   # resolved after lazy init on the first frame
             bias   = self.bias_mean  # may be None — handled inside update()
 
             for chunk in _iter_chunks(paths, cs):
@@ -643,6 +650,9 @@ class InstrumentModel:
                         frame, header = _load_frame(path)
                         self._check_or_set_shape(frame.shape[-2:], "dark")
                         self._update_meta_from_header(header)
+                        bayes_state.ensure_initialized(frame.shape[-2:])
+                        if dk_acc is None:
+                            dk_acc = bayes_state.dark_acc
                         frame    = frame.squeeze().astype(np.float64)
                         exp_time = _get_exposure_time(header)
                         bias_arr = (bias.astype(np.float64)
@@ -736,9 +746,10 @@ class InstrumentModel:
                           if self.read_noise is not None
                           else None)
 
-        if bayes_state is not None and bayes_state.flat_acc is not None:
+        if bayes_state is not None and (bayes_state.flat_acc is not None
+                                        or bayes_state.priors is not None):
             # --- Bayesian path ---
-            fl_acc    = bayes_state.flat_acc
+            fl_acc    = None   # resolved after lazy init on the first frame
             norm_acc  = WelfordAccumulator()   # track residuals for uncertainty
 
             for chunk in _iter_chunks(paths, cs):
@@ -747,6 +758,9 @@ class InstrumentModel:
                         frame, header = _load_frame(path)
                         self._check_or_set_shape(frame.shape[-2:], "flat")
                         self._update_meta_from_header(header)
+                        bayes_state.ensure_initialized(frame.shape[-2:])
+                        if fl_acc is None:
+                            fl_acc = bayes_state.flat_acc
                         frame = frame.squeeze()
                         if self.bias_mean is not None:
                             frame = frame - self.bias_mean.astype(np.float64)

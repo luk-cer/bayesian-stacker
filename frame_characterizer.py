@@ -125,7 +125,8 @@ class FrameMetadata:
     fwhm_pixels:  float
     n_stars_used: int
     solve_status: str
-    frame_path:   Optional[Path] = None
+    frame_path:   Optional[Path]      = None
+    calibrated:   Optional[np.ndarray] = None
 
     def summary(self) -> str:
         if self.shift is not None:
@@ -831,6 +832,7 @@ class FrameCharacterizer:
             n_stars_used = len(stamps),
             solve_status = solve_status,
             frame_path   = frame_path,
+            calibrated   = calibrated,
         )
         logger.info(
             "%s → t=%.3f  FWHM=%.2f\"  n_stars=%d  solve=%s",
