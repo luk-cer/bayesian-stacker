@@ -708,16 +708,19 @@ class BayesianAstroStacker:
         stats.save(stats_path)
         logger.info("SufficientStats saved → %s", stats_path)
 
+        bayer = model.bayer_pattern   # None for mono, e.g. 'RGGB' for OSC
+
         # Fast stack (Gamma-Poisson mean)
         if cfg.save_fast_stack:
             fast_path = output_dir / "fast_stack.fits"
-            stats.save_fast_stack_fits(fast_path)
+            stats.save_fast_stack_fits(fast_path, bayer_pattern=bayer)
             logger.info("Fast stack saved → %s", fast_path)
 
         # Phase 4 outputs
         if map_result is not None:
             lambda_path = output_dir / "lambda_hr.fits"
-            map_result.save_fits(lambda_path, quality_map=stats.quality_map)
+            map_result.save_fits(lambda_path, quality_map=stats.quality_map,
+                                 bayer_pattern=bayer)
             logger.info("Super-resolved scene saved → %s", lambda_path)
 
             if cfg.save_convergence_plot:

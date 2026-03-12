@@ -310,18 +310,25 @@ class MapResult:
 
     def save_fits(
         self,
-        path:         str | Path,
-        quality_map:  Optional[np.ndarray] = None,
+        path:          str | Path,
+        quality_map:   Optional[np.ndarray] = None,
+        bayer_pattern: Optional[str]        = None,
     ) -> None:
         """
         Write the super-resolved scene to a FITS file.
 
         Parameters
         ----------
-        path        : output .fits path
-        quality_map : optional [H, W] quality weight; will be upsampled to HR
-                      and stored as a second extension.
+        path          : output .fits path
+        quality_map   : optional [H, W] quality weight; upsampled to HR and
+                        stored as a named extension.
+        bayer_pattern : if set (e.g. 'RGGB'), the super-resolved Bayer mosaic
+                        is split into a [4, sH//2, sW//2] data cube — one
+                        plane per colour channel at native sub-pixel positions.
+                        Channel labels are written to CHANn keywords.
+                        For mono cameras leave as None (plain 2-D FITS).
         """
+        from instrument_model_artifact import bayer_split
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -336,12 +343,25 @@ class MapResult:
         hdr["ELAPSED"]  = round(self.elapsed_s, 1), "wall time seconds"
         hdr["COMMENT"]  = "Bayesian MAP super-resolved scene (Phase 4)"
 
-        primary = fits.PrimaryHDU(self.lambda_hr, header=hdr)
+        if bayer_pattern is not None:
+            planes, names = bayer_split(self.lambda_hr, bayer_pattern)
+            hdr["BAYERPAT"] = bayer_pattern
+            for i, n in enumerate(names, 1):
+                hdr[f"CHAN{i}"] = n
+            data = planes
+        else:
+            data = self.lambda_hr
+
+        primary = fits.PrimaryHDU(data, header=hdr)
         hdul    = fits.HDUList([primary])
 
         if quality_map is not None:
-            q_hr  = _upsample_numpy(quality_map, self.config.scale_factor)
-            hdul.append(fits.ImageHDU(q_hr.astype(np.float32), name="QUALITY"))
+            q_hr = _upsample_numpy(quality_map, self.config.scale_factor)
+            if bayer_pattern is not None:
+                q_planes, _ = bayer_split(q_hr, bayer_pattern)
+                hdul.append(fits.ImageHDU(q_planes, name="QUALITY"))
+            else:
+                hdul.append(fits.ImageHDU(q_hr.astype(np.float32), name="QUALITY"))
 
         hdul.writeto(str(path), overwrite=True)
         logger.info("MapResult saved to %s", path)

@@ -274,6 +274,35 @@ _BAYER_OFFSETS: Dict[str, Dict[str, Tuple[int,int]]] = {
 }
 
 
+def bayer_split(
+    frame:   np.ndarray,
+    pattern: str,
+) -> "Tuple[np.ndarray, List[str]]":
+    """
+    Split a [H, W] Bayer mosaic into a [4, H//2, W//2] float32 array.
+
+    Each of the 4 planes corresponds to one Bayer colour channel extracted
+    at its native sub-pixel position.  For RGGB the order is R, G0, G1, B;
+    other patterns are handled analogously via _BAYER_OFFSETS.
+
+    Parameters
+    ----------
+    frame   : [H, W] 2-D array (any numeric dtype)
+    pattern : Bayer pattern string, e.g. 'RGGB'
+
+    Returns
+    -------
+    planes : float32 [4, H//2, W//2] — one plane per channel
+    names  : list[str] of channel labels in the same order as planes
+    """
+    offsets = _BAYER_OFFSETS[pattern]
+    planes, names = [], []
+    for name, (r, c) in offsets.items():
+        planes.append(frame[r::2, c::2].astype(np.float32))
+        names.append(name)
+    return np.stack(planes, axis=0), names
+
+
 def _detect_frame_type(header: fits.Header) -> Optional[str]:
     raw = str(header.get("IMAGETYP", "")).strip().lower()
     for ftype, kws in _FRAME_TYPE_KEYWORDS.items():

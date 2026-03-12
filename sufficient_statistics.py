@@ -96,6 +96,25 @@ from astropy.io import fits
 
 logger = logging.getLogger(__name__)
 
+
+def _apply_phase_shift(arr: np.ndarray, dx: float, dy: float) -> np.ndarray:
+    """
+    Shift a 2-D array by (dx, dy) pixels using the Fourier phase-shift theorem.
+
+    dx : column shift (positive = shift content right)
+    dy : row    shift (positive = shift content down)
+
+    For alignment: pass (shift.dx_px, shift.dy_px) where those values equal
+    ref_position - frame_position, which moves the frame content onto the
+    reference grid.
+    """
+    H, W  = arr.shape
+    fy    = np.fft.fftfreq(H).reshape(-1, 1)
+    fx    = np.fft.rfftfreq(W).reshape(1, -1)
+    phase = np.exp(-2j * np.pi * (fy * dy + fx * dx))
+    return np.real(np.fft.irfft2(np.fft.rfft2(arr) * phase, s=(H, W)))
+
+
 # ---------------------------------------------------------------------------
 # Optional project imports
 # ---------------------------------------------------------------------------
@@ -379,8 +398,22 @@ class SufficientStats:
             frame_shape       = shp,
         )
 
-    def save_fast_stack_fits(self, path: str | Path) -> None:
-        """Write the weighted_mean fast stack as a FITS file."""
+    def save_fast_stack_fits(
+        self,
+        path:          str | Path,
+        bayer_pattern: Optional[str] = None,
+    ) -> None:
+        """
+        Write the weighted_mean fast stack as a FITS file.
+
+        For OSC cameras pass bayer_pattern (e.g. 'RGGB') to split the Bayer
+        mosaic into a [4, H//2, W//2] data cube with one plane per channel.
+        Channel order follows _BAYER_OFFSETS: R, G0, G1, B (or equivalent
+        for non-RGGB patterns).  The BAYERPAT and CHANn keywords record the
+        layout.  For mono cameras (bayer_pattern=None) a plain 2-D FITS is
+        written as before.
+        """
+        from instrument_model_artifact import bayer_split
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         hdr = fits.Header()
@@ -388,7 +421,14 @@ class SufficientStats:
         hdr["MEDTRANS"] = round(self.mean_transparency, 4)
         hdr["MEDFWHM"]  = round(self.mean_fwhm_arcsec, 3)
         hdr["COMMENT"]  = "Weighted mean stack (Gamma-Poisson posterior mean)"
-        fits.writeto(str(path), self.weighted_mean, hdr, overwrite=True)
+        if bayer_pattern is not None:
+            planes, names = bayer_split(self.weighted_mean, bayer_pattern)
+            hdr["BAYERPAT"] = bayer_pattern
+            for i, n in enumerate(names, 1):
+                hdr[f"CHAN{i}"] = n
+            fits.writeto(str(path), planes, hdr, overwrite=True)
+        else:
+            fits.writeto(str(path), self.weighted_mean, hdr, overwrite=True)
         logger.info("Fast stack saved to %s", path)
 
 
@@ -514,6 +554,15 @@ class SufficientStatsAccumulator:
         sky = meta.sky_bg.astype(np.float64)
         t   = float(meta.transparency)
         sub = cal - sky      # sky-subtracted calibrated frame
+
+        # Align to the reference frame via sub-pixel phase shift.
+        # shift.dx_px = ref_col - frame_col (column offset to reference grid)
+        # shift.dy_px = ref_row - frame_row (row offset to reference grid)
+        # The reference frame itself has shift=None (zero offset by definition).
+        sh = meta.shift
+        if sh is not None and (sh.dx_px != 0.0 or sh.dy_px != 0.0):
+            sub = _apply_phase_shift(sub, sh.dx_px, sh.dy_px)
+            sky = _apply_phase_shift(sky, sh.dx_px, sh.dy_px)
 
         H, W = cal.shape
         if self._shape is None:
