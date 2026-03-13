@@ -93,6 +93,7 @@ from typing import List, Optional, Tuple
 import h5py
 import numpy as np
 from astropy.io import fits
+from scipy.ndimage import rotate as _ndimage_rotate
 
 logger = logging.getLogger(__name__)
 
@@ -104,15 +105,33 @@ def _apply_phase_shift(arr: np.ndarray, dx: float, dy: float) -> np.ndarray:
     dx : column shift (positive = shift content right)
     dy : row    shift (positive = shift content down)
 
-    For alignment: pass (shift.dx_px, shift.dy_px) where those values equal
-    ref_position - frame_position, which moves the frame content onto the
-    reference grid.
+    Only the sub-pixel (fractional) part of the shift should be passed here.
+    The integer part is handled by direct placement into the canvas grid.
     """
     H, W  = arr.shape
     fy    = np.fft.fftfreq(H).reshape(-1, 1)
     fx    = np.fft.rfftfreq(W).reshape(1, -1)
     phase = np.exp(-2j * np.pi * (fy * dy + fx * dx))
     return np.real(np.fft.irfft2(np.fft.rfft2(arr) * phase, s=(H, W)))
+
+
+def _apply_rotation(arr: np.ndarray, angle_deg: float) -> np.ndarray:
+    """
+    Rotate a 2-D array by angle_deg degrees around its centre.
+
+    Uses scipy.ndimage.rotate with bilinear interpolation (order=1) and
+    reshape=False so the output is the same size as the input (pixels that
+    rotate outside the frame are set to zero, which is correct — they
+    contributed no data at that canvas position).
+
+    angle_deg : counter-clockwise rotation in degrees.
+                compute_frame_shift returns (ref_angle - frame_angle), so
+                passing rotation_deg directly rotates the frame content to
+                align with the reference orientation.
+    """
+    if abs(angle_deg) < 0.05:
+        return arr
+    return _ndimage_rotate(arr, angle_deg, reshape=False, order=1, cval=0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -421,14 +440,24 @@ class SufficientStats:
         hdr["MEDTRANS"] = round(self.mean_transparency, 4)
         hdr["MEDFWHM"]  = round(self.mean_fwhm_arcsec, 3)
         hdr["COMMENT"]  = "Weighted mean stack (Gamma-Poisson posterior mean)"
+        wm = self.weighted_mean
         if bayer_pattern is not None:
-            planes, names = bayer_split(self.weighted_mean, bayer_pattern)
             hdr["BAYERPAT"] = bayer_pattern
-            for i, n in enumerate(names, 1):
-                hdr[f"CHAN{i}"] = n
-            fits.writeto(str(path), planes, hdr, overwrite=True)
+            if wm.ndim == 3:
+                # Already split by calibrate_frame() — write cube directly.
+                # Channel names follow _BAYER_OFFSETS order for this pattern.
+                from instrument_model_artifact import _BAYER_OFFSETS
+                names = list(_BAYER_OFFSETS[bayer_pattern].keys())
+                for i, n in enumerate(names, 1):
+                    hdr[f"CHAN{i}"] = n
+                fits.writeto(str(path), wm, hdr, overwrite=True)
+            else:
+                planes, names = bayer_split(wm, bayer_pattern)
+                for i, n in enumerate(names, 1):
+                    hdr[f"CHAN{i}"] = n
+                fits.writeto(str(path), planes, hdr, overwrite=True)
         else:
-            fits.writeto(str(path), self.weighted_mean, hdr, overwrite=True)
+            fits.writeto(str(path), wm, hdr, overwrite=True)
         logger.info("Fast stack saved to %s", path)
 
 
@@ -473,10 +502,17 @@ class SufficientStatsAccumulator:
         frame_shape:   Optional[Tuple[int, int]] = None,
         outlier_sigma: float = 3.0,
     ) -> None:
-        self._shape         = frame_shape
+        self._shape         = frame_shape   # sensor pixel shape (H, W) per channel
         self._outlier_sigma = outlier_sigma
 
-        # Running accumulators — initialised on first frame
+        # Union-canvas geometry — set by set_canvas() before first add_calibrated.
+        # _canvas_shape : (cH, cW) — the union bounding box in sensor pixels
+        # _sensor_origin: (r0, c0) — where the reference frame's top-left corner
+        #                  sits within the canvas (always >= 0)
+        self._canvas_shape:  Optional[Tuple[int, int]] = None
+        self._sensor_origin: Tuple[int, int]           = (0, 0)
+
+        # Running accumulators — initialised on first frame (or set_canvas)
         self._weighted_sum: Optional[np.ndarray] = None
         self._weight_sum:   Optional[np.ndarray] = None
         self._sky_sum:      Optional[np.ndarray] = None
@@ -487,6 +523,36 @@ class SufficientStatsAccumulator:
         self._psf_list:         List[np.ndarray]  = []
         self._transparency_list: List[float]       = []
         self._fwhm_list:        List[float]        = []
+
+    # ------------------------------------------------------------------
+    # Canvas setup
+    # ------------------------------------------------------------------
+
+    def set_canvas(
+        self,
+        canvas_shape:  Tuple[int, int],
+        sensor_origin: Tuple[int, int],
+    ) -> None:
+        """
+        Configure the union bounding-box canvas before accumulation begins.
+
+        Must be called before the first add_calibrated() / add_frame() when
+        union-mode stacking is desired.  If never called the canvas defaults
+        to the sensor footprint (original behaviour).
+
+        Parameters
+        ----------
+        canvas_shape : (cH, cW)
+            Size of the union canvas in sensor-resolution pixels (per channel).
+            For OSC cameras this is already in half-resolution units.
+        sensor_origin : (r0, c0)
+            Pixel position within the canvas where the reference frame's
+            top-left corner (row 0, col 0) is placed.
+        """
+        if self._weighted_sum is not None:
+            raise RuntimeError("set_canvas() must be called before any frames are accumulated")
+        self._canvas_shape  = canvas_shape
+        self._sensor_origin = sensor_origin
 
     # ------------------------------------------------------------------
     # Core accumulation
@@ -553,36 +619,115 @@ class SufficientStatsAccumulator:
         cal = calibrated.astype(np.float64)
         sky = meta.sky_bg.astype(np.float64)
         t   = float(meta.transparency)
-        sub = cal - sky      # sky-subtracted calibrated frame
+        sh  = meta.shift
 
-        # Align to the reference frame via sub-pixel phase shift.
-        # shift.dx_px = ref_col - frame_col (column offset to reference grid)
-        # shift.dy_px = ref_row - frame_row (row offset to reference grid)
-        # The reference frame itself has shift=None (zero offset by definition).
-        sh = meta.shift
-        if sh is not None and (sh.dx_px != 0.0 or sh.dy_px != 0.0):
-            sub = _apply_phase_shift(sub, sh.dx_px, sh.dy_px)
-            sky = _apply_phase_shift(sky, sh.dx_px, sh.dy_px)
+        # Decompose shift into rotation + integer translation + sub-pixel fraction.
+        # Order: (1) rotate around frame centre, (2) integer-pixel canvas paste,
+        #        (3) sub-pixel Fourier phase-shift.
+        # dx_px / dy_px are in sensor-channel pixel units (half-res for OSC).
+        if sh is not None:
+            dx_total  = sh.dx_px
+            dy_total  = sh.dy_px
+            rot_deg   = sh.rotation_deg   # degrees, CCW, to align with reference
+        else:
+            dx_total  = 0.0
+            dy_total  = 0.0
+            rot_deg   = 0.0
 
-        H, W = cal.shape
+        dx_int  = int(round(dx_total))
+        dy_int  = int(round(dy_total))
+        dx_frac = dx_total - dx_int
+        dy_frac = dy_total - dy_int
+
+        # OSC path: calibrated is [4, H//2, W//2]; sky is [H//2, W//2].
+        if cal.ndim == 3:
+            n_ch  = cal.shape[0]
+            sub   = cal - sky[np.newaxis, :, :]   # [4, H//2, W//2]
+            # Rotation (applied per-channel; sky rotated once)
+            if abs(rot_deg) >= 0.05:
+                for c in range(n_ch):
+                    sub[c] = _apply_rotation(sub[c], rot_deg)
+                sky = _apply_rotation(sky, rot_deg)
+            # Sub-pixel phase shift
+            if dx_frac != 0.0 or dy_frac != 0.0:
+                for c in range(n_ch):
+                    sub[c] = _apply_phase_shift(sub[c], dx_frac, dy_frac)
+                sky = _apply_phase_shift(sky, dx_frac, dy_frac)
+            sky        = np.stack([sky] * n_ch, axis=0)   # [4, H//2, W//2]
+            data_shape = cal.shape[-2:]                    # (H//2, W//2)
+        else:
+            # Mono path: [H, W]
+            sub = cal - sky
+            if abs(rot_deg) >= 0.05:
+                sub = _apply_rotation(sub, rot_deg)
+                sky = _apply_rotation(sky, rot_deg)
+            if dx_frac != 0.0 or dy_frac != 0.0:
+                sub = _apply_phase_shift(sub, dx_frac, dy_frac)
+                sky = _apply_phase_shift(sky, dx_frac, dy_frac)
+            data_shape = cal.shape             # (H, W)
+
         if self._shape is None:
-            self._shape = (H, W)
-        elif self._shape != (H, W):
+            self._shape = data_shape
+        elif self._shape != data_shape:
             raise ValueError(
-                f"Frame shape {(H, W)} differs from expected {self._shape}"
+                f"Frame shape {data_shape} differs from expected {self._shape}"
             )
 
-        # Lazy initialisation of accumulator arrays
-        if self._weighted_sum is None:
-            self._weighted_sum = np.zeros((H, W), dtype=np.float64)
-            self._weight_sum   = np.zeros((H, W), dtype=np.float64)
-            self._sky_sum      = np.zeros((H, W), dtype=np.float64)
-            self._sq_sum       = np.zeros((H, W), dtype=np.float64)
+        # Determine canvas shape and sensor origin.
+        # If set_canvas() was called, use the union canvas; otherwise fall back
+        # to the sensor footprint (zero offset, canvas == sensor).
+        if self._canvas_shape is not None:
+            cH, cW = self._canvas_shape
+        else:
+            cH, cW = data_shape
 
-        self._weighted_sum += t * sub
-        self._weight_sum   += t
-        self._sky_sum      += sky
-        self._sq_sum       += t * sub ** 2
+        r0, c0 = self._sensor_origin   # reference-frame top-left in canvas
+
+        # Lazy initialisation of accumulator arrays on the canvas grid
+        if self._weighted_sum is None:
+            if cal.ndim == 3:
+                canvas_arr_shape = (n_ch, cH, cW)
+            else:
+                canvas_arr_shape = (cH, cW)
+            self._weighted_sum = np.zeros(canvas_arr_shape, dtype=np.float64)
+            self._weight_sum   = np.zeros(canvas_arr_shape, dtype=np.float64)
+            self._sky_sum      = np.zeros(canvas_arr_shape, dtype=np.float64)
+            self._sq_sum       = np.zeros(canvas_arr_shape, dtype=np.float64)
+
+        # After rotation scipy keeps output shape = input shape (reshape=False),
+        # so sub/sky are still data_shape even after rotation.  The canvas
+        # placement uses the integer translation only — rotation is already baked
+        # into the pixel values.
+        fr0 = r0 + dy_int
+        fc0 = c0 + dx_int
+        fH, fW = data_shape   # shape of rotated (or unrotated) frame tile
+
+        # Clamp to canvas bounds (safety — should be exact for correctly computed union)
+        r_src0 = max(0, -fr0);      r_src1 = fH - max(0, fr0 + fH - cH)
+        c_src0 = max(0, -fc0);      c_src1 = fW - max(0, fc0 + fW - cW)
+        r_dst0 = max(0,  fr0);      r_dst1 = r_dst0 + (r_src1 - r_src0)
+        c_dst0 = max(0,  fc0);      c_dst1 = c_dst0 + (c_src1 - c_src0)
+
+        if r_src1 <= r_src0 or c_src1 <= c_src0:
+            logger.warning("Frame shift places it entirely outside canvas — skipping")
+            return
+
+        if cal.ndim == 3:
+            self._weighted_sum[:, r_dst0:r_dst1, c_dst0:c_dst1] += \
+                t * sub[:, r_src0:r_src1, c_src0:c_src1]
+            self._weight_sum[:, r_dst0:r_dst1, c_dst0:c_dst1] += t
+            self._sky_sum[:, r_dst0:r_dst1, c_dst0:c_dst1] += \
+                sky[:, r_src0:r_src1, c_src0:c_src1]
+            self._sq_sum[:, r_dst0:r_dst1, c_dst0:c_dst1] += \
+                t * sub[:, r_src0:r_src1, c_src0:c_src1] ** 2
+        else:
+            self._weighted_sum[r_dst0:r_dst1, c_dst0:c_dst1] += \
+                t * sub[r_src0:r_src1, c_src0:c_src1]
+            self._weight_sum[r_dst0:r_dst1, c_dst0:c_dst1] += t
+            self._sky_sum[r_dst0:r_dst1, c_dst0:c_dst1] += \
+                sky[r_src0:r_src1, c_src0:c_src1]
+            self._sq_sum[r_dst0:r_dst1, c_dst0:c_dst1] += \
+                t * sub[r_src0:r_src1, c_src0:c_src1] ** 2
 
         self._shift_list.append(meta.shift)
         self._psf_list.append(meta.psf_total.copy())
@@ -614,6 +759,10 @@ class SufficientStatsAccumulator:
 
         self._report_outliers()
 
+        # frame_shape reported to MAP stacker is the canvas (union bbox) size,
+        # which equals the sensor size when set_canvas() was not called.
+        reported_shape = self._canvas_shape if self._canvas_shape is not None else self._shape
+
         return SufficientStats(
             weighted_sum      = self._weighted_sum.astype(np.float32),
             weight_sum        = self._weight_sum.astype(np.float32),
@@ -624,7 +773,7 @@ class SufficientStatsAccumulator:
             psf_list          = [p.copy() for p in self._psf_list],
             transparency_list = list(self._transparency_list),
             fwhm_list         = list(self._fwhm_list),
-            frame_shape       = self._shape,
+            frame_shape       = reported_shape,
         )
 
     def save(self, path: str | Path) -> None:

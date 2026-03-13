@@ -774,12 +774,21 @@ class FrameCharacterizer:
         name = frame_path.name if frame_path else "<array>"
         logger.info("Characterizing %s  (exp=%.0f s)", name, exposure_s)
 
+        # For OSC cameras calibrate_frame() returns [4, H//2, W//2].
+        # Collapse to a luminance image for all spatial detection tasks
+        # (sky background, star extraction, PSF fitting, transparency).
+        # Every downstream consumer that needs pixel values uses `lum`.
+        if calibrated.ndim == 3:
+            lum = calibrated.mean(axis=0).astype(np.float32)   # [H//2, W//2]
+        else:
+            lum = calibrated                                     # [H, W] mono
+
         # 1. Sky background
-        sky_bg = estimate_sky_background(calibrated, poly_degree=self.poly_degree)
+        sky_bg = estimate_sky_background(lum, poly_degree=self.poly_degree)
 
         # 2. Star extraction
         positions, stamps = extract_stars(
-            calibrated, sky_bg,
+            lum, sky_bg,
             snr_threshold  = self.snr_threshold,
             saturation_adu = self.saturation_adu,
             stamp_size     = self.stamp_size,
@@ -800,20 +809,39 @@ class FrameCharacterizer:
 
         # 5. Transparency
         if is_reference:
-            sub = calibrated.astype(np.float64) - sky_bg.astype(np.float64)
+            sub = lum.astype(np.float64) - sky_bg.astype(np.float64)
             self._ref_fluxes    = _aperture_fluxes(sub, positions, self.aperture_r_px)
             self._ref_positions = positions
             transparency        = 1.0
         else:
             transparency = estimate_transparency(
-                positions, calibrated, sky_bg,
+                positions, lum, sky_bg,
                 ref_fluxes  = self._ref_fluxes,
                 aperture_r  = self.aperture_r_px,
             )
 
-        # 6. WCS shift
+        # 6. WCS shift.
+        # For OSC cameras the WCS plate-solve was done on the full [H, W] Bayer
+        # mosaic, so CRPIX is in full-frame pixel coordinates.  We must pass the
+        # full frame shape to compute_frame_shift so that the frame centre is
+        # correct.  The returned dx_px/dy_px are then in full-frame pixel units;
+        # divide by 2 to convert to the half-resolution channel grid that
+        # _accumulate and _apply_phase_shift operate on.
         wcs_geom, solve_status = self._extract_wcs(header)
-        shift = self._compute_shift(wcs_geom, calibrated.shape, is_reference)
+        is_osc_frame = (calibrated.ndim == 3)
+        full_shape = (lum.shape[0] * 2, lum.shape[1] * 2) if is_osc_frame else lum.shape
+        shift = self._compute_shift(wcs_geom, full_shape, is_reference)
+        if shift is not None and is_osc_frame:
+            # Re-express shift in half-resolution (Bayer-channel) pixel units
+            from optics import FrameShift as _FrameShift
+            shift = _FrameShift(
+                dx_px        = shift.dx_px        / 2.0,
+                dy_px        = shift.dy_px        / 2.0,
+                dx_arcsec    = shift.dx_arcsec,
+                dy_arcsec    = shift.dy_arcsec,
+                rotation_deg = shift.rotation_deg,
+                scale_ratio  = shift.scale_ratio,
+            )
 
         # Update session state
         self._prior_psf     = psf_total

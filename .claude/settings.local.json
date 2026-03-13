@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(where gh:*)"
+      "Bash(where gh:*)",
+      "Bash(python app.py)",
+      "Bash(python -c \":*)"
     ]
   }
 }

@@ -790,9 +790,12 @@ class InstrumentModel:
                         bayes_state.ensure_initialized(frame.shape[-2:])
                         if fl_acc is None:
                             fl_acc = bayes_state.flat_acc
-                        frame = frame.squeeze()
+                        frame    = frame.squeeze()
+                        exp_time = _get_exposure_time(header)
                         if self.bias_mean is not None:
                             frame = frame - self.bias_mean.astype(np.float64)
+                        if self.dark_rate is not None:
+                            frame = frame - self.dark_rate.astype(np.float64) * exp_time
                         raw_acc.update(frame)
 
                         # Per-channel or global normalisation
@@ -831,9 +834,12 @@ class InstrumentModel:
                         frame, header = _load_frame(path)
                         self._check_or_set_shape(frame.shape[-2:], "flat")
                         self._update_meta_from_header(header)
-                        frame = frame.squeeze()
+                        frame    = frame.squeeze()
+                        exp_time = _get_exposure_time(header)
                         if self.bias_mean is not None:
                             frame = frame - self.bias_mean.astype(np.float64)
+                        if self.dark_rate is not None:
+                            frame = frame - self.dark_rate.astype(np.float64) * exp_time
                         raw_acc.update(frame)
                         if self._is_osc():
                             normed = self._bayer_normalise(frame)
@@ -1058,8 +1064,11 @@ class InstrumentModel:
 
         Returns
         -------
-        Calibrated frame as float32.  Dead / very-low-gain pixels are
-        protected against division by zero (flat_gain < 0.01 → no division).
+        For mono cameras: calibrated frame as float32 [H, W].
+        For OSC cameras:  calibrated Bayer planes as float32 [4, H//2, W//2].
+                          Channels are split immediately to prevent any
+                          subsequent processing from contaminating colour
+                          channels via full-mosaic operations (e.g. phase shifts).
         """
         frame = raw.astype(np.float32)
         if self.bias_mean  is not None:
@@ -1069,6 +1078,9 @@ class InstrumentModel:
         if self.flat_gain  is not None:
             safe_gain = np.where(self.flat_gain > 0.01, self.flat_gain, 1.0)
             frame    /= safe_gain
+        if self._is_osc():
+            planes, _ = bayer_split(frame, self.bayer_pattern)
+            return planes  # [4, H//2, W//2]
         return frame
 
     # ==========================================================================

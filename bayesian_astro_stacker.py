@@ -320,6 +320,71 @@ class PipelineResult:
 
 
 # ============================================================================
+# Union bounding-box helper
+# ============================================================================
+
+def _rotated_frame_bbox(H: int, W: int, angle_deg: float) -> tuple:
+    """Axis-aligned bounding box of an H×W frame rotated by angle_deg degrees."""
+    if abs(angle_deg) < 0.05:
+        return H, W
+    rad = np.radians(angle_deg)
+    cos_a, sin_a = abs(np.cos(rad)), abs(np.sin(rad))
+    return int(np.ceil(H * cos_a + W * sin_a)), int(np.ceil(W * cos_a + H * sin_a))
+
+
+def _compute_union_canvas(
+    sensor_shape: tuple,
+    shifts: list,
+) -> tuple:
+    """
+    Compute the union bounding box of all shifted and rotated frames.
+
+    Parameters
+    ----------
+    sensor_shape : (H, W)
+        Pixel dimensions of a single frame (channel/accumulation grid,
+        half-res for OSC).
+    shifts : list of FrameShift or None
+        Per-frame shifts in sensor-channel pixel units.  None = zero shift.
+
+    Returns
+    -------
+    canvas_shape  : (cH, cW)  — union bounding box size
+    sensor_origin : (r0, c0)  — where the reference frame's top-left sits
+                                in the canvas (always >= 0)
+    """
+    H, W = sensor_shape
+
+    row_mins, row_maxs = [], []
+    col_mins, col_maxs = [], []
+
+    for sh in shifts:
+        dy_int  = int(round(sh.dy_px))   if sh is not None else 0
+        dx_int  = int(round(sh.dx_px))   if sh is not None else 0
+        rot_deg = sh.rotation_deg        if sh is not None else 0.0
+        fH, fW  = _rotated_frame_bbox(H, W, rot_deg)
+        # Rotation expands the bbox symmetrically around the frame centre;
+        # top-left corner shifts by half the expansion.
+        r_pad   = (fH - H) // 2
+        c_pad   = (fW - W) // 2
+        r0f     = dy_int - r_pad
+        c0f     = dx_int - c_pad
+        row_mins.append(r0f);       row_maxs.append(r0f + fH)
+        col_mins.append(c0f);       col_maxs.append(c0f + fW)
+
+    row_min = min(row_mins)
+    col_min = min(col_mins)
+    cH = max(row_maxs) - row_min
+    cW = max(col_maxs) - col_min
+
+    # Reference frame's top-left in canvas coords
+    r0 = -row_min
+    c0 = -col_min
+
+    return (cH, cW), (r0, c0)
+
+
+# ============================================================================
 # BayesianAstroStacker
 # ============================================================================
 
@@ -596,15 +661,17 @@ class BayesianAstroStacker:
         fc:          FrameCharacterizer,
         output_dir:  Path,
     ):
-        cfg        = self.config
-        acc        = SufficientStatsAccumulator(
-            frame_shape=model.frame_shape if model.frame_shape else None
-        )
-        n_used     = 0
+        cfg = self.config
+
+        # ── Pass 1: characterise every frame, collect metadata ─────────────
+        # Buffer (calibrated, meta) for accepted frames so Pass 2 can place
+        # them into the union canvas without re-loading from disk.
+        accepted: List[tuple] = []   # list of (calibrated_array, FrameMetadata)
         n_rejected = 0
+        is_osc_batch: Optional[bool] = None
 
         for i, path in enumerate(light_paths):
-            is_ref = (n_used == 0)
+            is_ref = (len(accepted) == 0)
             exp_s  = cfg.exposure_s or _read_exptime(path)
 
             try:
@@ -615,6 +682,23 @@ class BayesianAstroStacker:
                                path.name, exc)
                 n_rejected += 1
                 continue
+
+            # Enforce homogeneous batch: all OSC or all mono
+            frame_is_osc = (meta.calibrated is not None
+                            and meta.calibrated.ndim == 3)
+            if is_osc_batch is None:
+                is_osc_batch = frame_is_osc
+                logger.info(
+                    "Batch type: %s (detected from first frame)",
+                    "OSC" if is_osc_batch else "mono",
+                )
+            elif frame_is_osc != is_osc_batch:
+                raise ValueError(
+                    f"Mixed OSC/mono inputs: frame {path.name} has "
+                    f"calibrated.ndim={'3 (OSC)' if frame_is_osc else '2 (mono)'} "
+                    f"but the batch started as "
+                    f"{'OSC' if is_osc_batch else 'mono'}."
+                )
 
             # Quality filter
             if meta.transparency < cfg.min_transparency:
@@ -628,28 +712,59 @@ class BayesianAstroStacker:
                 n_rejected += 1
                 continue
 
-            acc.add_calibrated(meta.calibrated, meta)
-            n_used += 1
-
-            if n_used % cfg.checkpoint_every == 0:
-                ckpt = output_dir / "stats_checkpoint.h5"
-                acc.save(ckpt)
-                logger.info("Checkpoint saved (%d frames) → %s", n_used, ckpt)
-
+            accepted.append((meta.calibrated, meta))
             logger.info(
-                "Frame %3d/%d  t=%.3f  FWHM=%.2f\"  accepted=%d  rejected=%d",
+                "Pass1 frame %3d/%d  t=%.3f  FWHM=%.2f\"  accepted=%d  rejected=%d",
                 i+1, len(light_paths),
                 meta.transparency, meta.fwhm_arcsec or 0.,
-                n_used, n_rejected,
+                len(accepted), n_rejected,
             )
 
-        if n_used == 0:
+        if not accepted:
             raise RuntimeError(
                 "No frames passed quality filtering.  "
                 "Lower min_transparency or max_fwhm_arcsec."
             )
 
-        stats = acc.finalize()
+        # ── Compute union bounding box ──────────────────────────────────────
+        # sensor_shape is the per-channel pixel dimensions:
+        #   OSC → (H//2, W//2);  mono → (H, W)
+        first_cal = accepted[0][0]
+        if first_cal.ndim == 3:
+            sensor_shape = first_cal.shape[-2:]
+        else:
+            sensor_shape = first_cal.shape
+
+        all_shifts   = [meta.shift for _, meta in accepted]
+        canvas_shape, sensor_origin = _compute_union_canvas(sensor_shape, all_shifts)
+
+        logger.info(
+            "Union canvas: sensor=%s  canvas=%s  origin=%s  "
+            "(expansion: +%d rows, +%d cols)",
+            sensor_shape, canvas_shape, sensor_origin,
+            canvas_shape[0] - sensor_shape[0],
+            canvas_shape[1] - sensor_shape[1],
+        )
+
+        # ── Pass 2: accumulate into union canvas ────────────────────────────
+        acc = SufficientStatsAccumulator()
+        acc.set_canvas(canvas_shape, sensor_origin)
+
+        for j, (cal, meta) in enumerate(accepted):
+            acc.add_calibrated(cal, meta)
+
+            if (j + 1) % cfg.checkpoint_every == 0:
+                ckpt = output_dir / "stats_checkpoint.h5"
+                acc.save(ckpt)
+                logger.info("Checkpoint saved (%d frames) → %s", j + 1, ckpt)
+
+            logger.info(
+                "Pass2 frame %3d/%d  accumulated",
+                j + 1, len(accepted),
+            )
+
+        stats  = acc.finalize()
+        n_used = len(accepted)
         logger.info("Phase 3 complete: %d/%d frames  %s",
                     n_used, len(light_paths), stats.summary())
         return stats, n_used

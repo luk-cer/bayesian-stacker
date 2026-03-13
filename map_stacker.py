@@ -344,11 +344,20 @@ class MapResult:
         hdr["COMMENT"]  = "Bayesian MAP super-resolved scene (Phase 4)"
 
         if bayer_pattern is not None:
-            planes, names = bayer_split(self.lambda_hr, bayer_pattern)
             hdr["BAYERPAT"] = bayer_pattern
-            for i, n in enumerate(names, 1):
-                hdr[f"CHAN{i}"] = n
-            data = planes
+            lhr = self.lambda_hr
+            if lhr.ndim == 3:
+                # Already split — write the [4, sH, sW] cube directly.
+                from instrument_model_artifact import _BAYER_OFFSETS
+                names = list(_BAYER_OFFSETS[bayer_pattern].keys())
+                for i, n in enumerate(names, 1):
+                    hdr[f"CHAN{i}"] = n
+                data = lhr
+            else:
+                planes, names = bayer_split(lhr, bayer_pattern)
+                for i, n in enumerate(names, 1):
+                    hdr[f"CHAN{i}"] = n
+                data = planes
         else:
             data = self.lambda_hr
 
@@ -356,12 +365,21 @@ class MapResult:
         hdul    = fits.HDUList([primary])
 
         if quality_map is not None:
-            q_hr = _upsample_numpy(quality_map, self.config.scale_factor)
-            if bayer_pattern is not None:
-                q_planes, _ = bayer_split(q_hr, bayer_pattern)
-                hdul.append(fits.ImageHDU(q_planes, name="QUALITY"))
+            qm = quality_map
+            if qm.ndim == 3:
+                # Already [4, H//2, W//2]; upsample each channel plane
+                q_planes = np.stack([
+                    _upsample_numpy(qm[c], self.config.scale_factor)
+                    for c in range(qm.shape[0])
+                ], axis=0)
+                hdul.append(fits.ImageHDU(q_planes.astype(np.float32), name="QUALITY"))
             else:
-                hdul.append(fits.ImageHDU(q_hr.astype(np.float32), name="QUALITY"))
+                q_hr = _upsample_numpy(qm, self.config.scale_factor)
+                if bayer_pattern is not None and q_hr.ndim == 2:
+                    q_planes, _ = bayer_split(q_hr, bayer_pattern)
+                    hdul.append(fits.ImageHDU(q_planes, name="QUALITY"))
+                else:
+                    hdul.append(fits.ImageHDU(q_hr.astype(np.float32), name="QUALITY"))
 
         hdul.writeto(str(path), overwrite=True)
         logger.info("MapResult saved to %s", path)
@@ -433,7 +451,11 @@ def _convolve_psf_numpy(
     psf: np.ndarray,
 ) -> np.ndarray:
     """
-    Convolve HR scene with PSF using zero-padded FFT.
+    Convolve HR scene with PSF using reflection-padded FFT.
+
+    Reflection padding creates a smooth periodic extension that eliminates
+    the rectangular window / Gibbs ringing artefacts produced by zero-padding.
+    The PSF kernel is still zero-padded (reflection makes no sense for a kernel).
 
     hr  : [sH, sW] float64
     psf : [K, K]   float64  (sum = 1)
@@ -444,9 +466,11 @@ def _convolve_psf_numpy(
     pH      = _next_power_of_2(sH + K)
     pW      = _next_power_of_2(sW + K)
 
-    hr_pad  = np.zeros((pH, pW), dtype=np.float64)
-    hr_pad[:sH, :sW] = hr
+    # Reflect-pad the scene to avoid edge discontinuities
+    pad_h, pad_w = pH - sH, pW - sW
+    hr_pad = np.pad(hr, ((0, pad_h), (0, pad_w)), mode='reflect')
 
+    # Zero-pad the PSF kernel (reflection is meaningless for a kernel)
     psf_pad = np.zeros((pH, pW), dtype=np.float64)
     psf_cy, psf_cx = K // 2, K // 2
     psf_pad[:K, :K] = psf
@@ -637,8 +661,17 @@ def _forward_single(
 
     sH, sW = lam.shape
 
-    # Fourier transform
-    lam_f  = torch.fft.rfft2(lam, s=(pH, pW))               # [pH, pW//2+1]
+    # Reflection-pad to (pH, pW) before FFT to eliminate the rectangular
+    # window / Gibbs ringing that zero-padding would introduce.
+    # Only the scene is reflection-padded; the PSF spectrum was built with
+    # zero-padding (_make_psf_spectrum) which is correct for a kernel.
+    # F.pad with mode='reflect' and 4 pad values requires >= 3D input.
+    lam_padded = F.pad(
+        lam.unsqueeze(0).unsqueeze(0),          # [1, 1, sH, sW]
+        (0, pW - sW, 0, pH - sH),
+        mode='reflect',
+    ).squeeze(0).squeeze(0)                      # [pH, pW]
+    lam_f  = torch.fft.rfft2(lam_padded)                    # [pH, pW//2+1]
 
     # Phase-shift (sub-pixel translation in LR pixels → HR pixel units)
     lam_f  = lam_f * phase_ramp                              # element-wise
@@ -669,11 +702,22 @@ def _poisson_nll_torch(
 
 
 def _tv_torch(lam: "torch.Tensor", eps: float = 1e-8) -> "torch.Tensor":
-    """Isotropic total variation."""
-    dx = lam[:, 1:] - lam[:, :-1]    # [sH, sW-1]
-    dy = lam[1:, :] - lam[:-1, :]    # [sH-1, sW]
+    """
+    Truly isotropic total variation using four gradient directions.
+
+    The standard 2-term formulation (dx, dy only) assigns diagonal gradients
+    a sqrt(2) higher cost than axis-aligned ones, which biases the optimizer
+    toward axis-aligned features and reinforces cross-pattern artefacts.
+    Adding diagonal difference terms with 1/sqrt(2) scaling equalises all
+    directions.
+    """
+    dx   = lam[:, 1:]  - lam[:, :-1]           # [H,   W-1]
+    dy   = lam[1:, :]  - lam[:-1, :]           # [H-1, W  ]
+    dxy  = (lam[1:, 1:]  - lam[:-1, :-1]) * 0.70711   # [H-1, W-1] / sqrt(2)
+    dyx  = (lam[1:, :-1] - lam[:-1, 1:])  * 0.70711   # [H-1, W-1] / sqrt(2)
+    H, W = lam.shape
     return torch.sqrt(
-        dx[:lam.shape[0]-1, :]**2 + dy[:, :lam.shape[1]-1]**2 + eps
+        dx[:H-1, :]**2 + dy[:, :W-1]**2 + dxy**2 + dyx**2 + eps
     ).sum()
 
 
@@ -737,6 +781,69 @@ def _theta_init(prior_hr: np.ndarray) -> np.ndarray:
 
 
 # ============================================================================
+# FAST mode solver — multi-channel (OSC) helper
+# ============================================================================
+
+def _solve_fast_multichannel(
+    stats:  "SufficientStats",
+    config: MapConfig,
+    dev:    "torch.device",
+) -> "MapResult":
+    """
+    Run _solve_fast independently for each Bayer channel and stack results.
+
+    stats.weighted_sum is [4, H//2, W//2].  A proxy SufficientStats with a
+    single channel is constructed for each channel so that the existing
+    _solve_fast() mono code path is reused without modification.
+    """
+    n_channels = stats.weighted_sum.shape[0]
+    channel_results: List[np.ndarray] = []
+    t0 = time.time()
+
+    # Aggregate loss/grad histories across channels
+    all_loss: List[float] = []
+    all_grad: List[float] = []
+    last_n_iter = 0
+    last_converged = False
+
+    for c in range(n_channels):
+        logger.info("FAST multi-channel: solving channel %d/%d", c + 1, n_channels)
+
+        # Build a mono-equivalent SufficientStats for this channel
+        ch_stats = SufficientStats(
+            weighted_sum      = stats.weighted_sum[c].astype(np.float32),
+            weight_sum        = stats.weight_sum[c].astype(np.float32),
+            sky_sum           = stats.sky_sum[c].astype(np.float32),
+            sq_sum            = stats.sq_sum[c].astype(np.float32),
+            frame_count       = stats.frame_count,
+            shift_list        = stats.shift_list,
+            psf_list          = stats.psf_list,
+            transparency_list = stats.transparency_list,
+            fwhm_list         = stats.fwhm_list,
+            frame_shape       = stats.frame_shape,  # (H//2, W//2)
+        )
+        ch_result = _solve_fast(ch_stats, config, dev)
+        channel_results.append(ch_result.lambda_hr)
+        all_loss.extend(ch_result.loss_history)
+        all_grad.extend(ch_result.grad_norm_history)
+        last_n_iter     = ch_result.n_iter
+        last_converged  = ch_result.converged
+
+    lambda_hr_4ch = np.stack(channel_results, axis=0)   # [4, sH, sW]
+
+    return MapResult(
+        lambda_hr         = lambda_hr_4ch,
+        loss_history      = all_loss,
+        grad_norm_history = all_grad,
+        n_iter            = last_n_iter,
+        converged         = last_converged,
+        device            = str(dev),
+        config            = config,
+        elapsed_s         = time.time() - t0,
+    )
+
+
+# ============================================================================
 # FAST mode solver
 # ============================================================================
 
@@ -749,14 +856,14 @@ def _solve_fast(
     FAST mode: treats the Phase 3 weighted_sum / weight_sum as a single
     synthetic super-exposure and optimises on it.
 
-    Effective forward model:
-        λ_lr_expected = (1/N_eff) · D(H̄ ⊛ λ_hr)
-        NLL = Poisson_NLL(weighted_sum | weight_sum_eff · D(H̄ ⊛ λ_hr))
-
-    where H̄ = mean PSF across all frames, weight_sum_eff = median(weight_sum).
-    No per-frame shift is applied (the weighted_sum already encodes shifts
-    implicitly — this is the approximation of FAST mode).
+    For OSC cameras the accumulated statistics are [4, H//2, W//2].
+    Each Bayer channel is solved independently and the results are stacked
+    into a [4, sH, sW] array in MapResult.lambda_hr.
     """
+    # --- Multi-channel (OSC) dispatch ---
+    if stats.weighted_sum.ndim == 3:
+        return _solve_fast_multichannel(stats, config, dev)
+
     H, W   = stats.frame_shape
     S      = config.scale_factor
     sH, sW = H * S, W * S
