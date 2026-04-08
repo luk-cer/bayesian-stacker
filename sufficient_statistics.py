@@ -93,7 +93,7 @@ from typing import List, Optional, Tuple
 import h5py
 import numpy as np
 from astropy.io import fits
-from scipy.ndimage import rotate as _ndimage_rotate
+from scipy.ndimage import affine_transform as _affine_transform
 
 logger = logging.getLogger(__name__)
 
@@ -101,13 +101,10 @@ logger = logging.getLogger(__name__)
 def _apply_phase_shift(arr: np.ndarray, dx: float, dy: float) -> np.ndarray:
     """
     Shift a 2-D array by (dx, dy) pixels using the Fourier phase-shift theorem.
-
-    dx : column shift (positive = shift content right)
-    dy : row    shift (positive = shift content down)
-
-    Only the sub-pixel (fractional) part of the shift should be passed here.
-    The integer part is handled by direct placement into the canvas grid.
+    Used only for the sub-pixel residual after affine resampling.
     """
+    if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+        return arr
     H, W  = arr.shape
     fy    = np.fft.fftfreq(H).reshape(-1, 1)
     fx    = np.fft.rfftfreq(W).reshape(1, -1)
@@ -115,23 +112,81 @@ def _apply_phase_shift(arr: np.ndarray, dx: float, dy: float) -> np.ndarray:
     return np.real(np.fft.irfft2(np.fft.rfft2(arr) * phase, s=(H, W)))
 
 
-def _apply_rotation(arr: np.ndarray, angle_deg: float) -> np.ndarray:
+def _warp_to_canvas(
+    arr:           np.ndarray,
+    frame_wcs,                   # WCSGeometry of this frame
+    ref_wcs,                     # WCSGeometry of the reference frame
+    canvas_shape:  tuple,        # (cH, cW) output canvas size
+    sensor_origin: tuple,        # (r0, c0) reference frame origin in canvas
+    osc_scale:     int = 1,      # 2 for OSC (half-res), 1 for mono
+) -> np.ndarray:
     """
-    Rotate a 2-D array by angle_deg degrees around its centre.
+    Resample `arr` (a single 2-D channel) onto the union canvas using a full
+    affine transform derived from the WCS solutions of the frame and the
+    reference.  This correctly handles rotation, sub-pixel translation, and
+    small scale differences in a single interpolation pass.
 
-    Uses scipy.ndimage.rotate with bilinear interpolation (order=1) and
-    reshape=False so the output is the same size as the input (pixels that
-    rotate outside the frame are set to zero, which is correct — they
-    contributed no data at that canvas position).
+    The mapping is: for each canvas pixel (r_c, c_c) find the corresponding
+    frame pixel (r_f, c_f) via WCS sky projection, then interpolate.
 
-    angle_deg : counter-clockwise rotation in degrees.
-                compute_frame_shift returns (ref_angle - frame_angle), so
-                passing rotation_deg directly rotates the frame content to
-                align with the reference orientation.
+    Parameters
+    ----------
+    arr          : [H, W] float64 frame channel data
+    frame_wcs    : WCSGeometry (plate-solved) for this frame
+    ref_wcs      : WCSGeometry for the reference frame
+    canvas_shape : (cH, cW) — size of the output canvas
+    sensor_origin: (r0, c0) — where the reference frame top-left sits
+    osc_scale    : 1 for mono, 2 for OSC (pixel coords are half-res)
     """
-    if abs(angle_deg) < 0.05:
-        return arr
-    return _ndimage_rotate(arr, angle_deg, reshape=False, order=1, cval=0.0)
+    cH, cW   = canvas_shape
+    r0, c0   = sensor_origin
+    fH, fW   = arr.shape
+
+    # Build the affine matrix mapping canvas pixels → frame pixels.
+    # We use a 3-point WCS round-trip to derive the linear map:
+    #   canvas_px → sky (via reference WCS) → frame_px (via frame WCS inverse)
+    # Sample at canvas centre and two offset points to get a 2×2 Jacobian + offset.
+
+    cc_r = (cH - 1) / 2.0
+    cc_c = (cW - 1) / 2.0
+    delta = min(cH, cW) / 4.0
+
+    def canvas_to_frame(cr, cc):
+        """Canvas (row,col) → frame (row,col) via WCS sky roundtrip."""
+        # Canvas pixel → reference pixel (subtract sensor origin)
+        ref_col = (cc - c0) * osc_scale
+        ref_row = (cr - r0) * osc_scale
+        # Reference pixel → sky (astropy uses col,row = x,y order)
+        sky = ref_wcs.wcs.pixel_to_world(ref_col, ref_row)
+        # Sky → frame pixel
+        fx, fy = frame_wcs.wcs.world_to_pixel(sky)
+        # Frame pixel → frame array index (divide by osc_scale for half-res)
+        return float(fy) / osc_scale, float(fx) / osc_scale
+
+    p0 = canvas_to_frame(cc_r,         cc_c)
+    px = canvas_to_frame(cc_r,         cc_c + delta)
+    py = canvas_to_frame(cc_r + delta, cc_c)
+
+    # Jacobian columns: d(frame)/d(canvas_col) and d(frame)/d(canvas_row)
+    dcol = ((px[0]-p0[0])/delta, (px[1]-p0[1])/delta)
+    drow = ((py[0]-p0[0])/delta, (py[1]-p0[1])/delta)
+
+    # Affine matrix A [2×2]: maps canvas offset → frame offset
+    A = np.array([[drow[0], dcol[0]],
+                  [drow[1], dcol[1]]])
+
+    # Offset: frame_centre - A @ canvas_centre
+    offset = np.array([p0[0] - A[0,0]*cc_r - A[0,1]*cc_c,
+                       p0[1] - A[1,0]*cc_r - A[1,1]*cc_c])
+
+    out = _affine_transform(
+        arr, A, offset=offset,
+        output_shape=(cH, cW),
+        order=3,          # bicubic — best quality for astronomical images
+        mode='constant',
+        cval=0.0,
+    )
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -619,52 +674,16 @@ class SufficientStatsAccumulator:
         cal = calibrated.astype(np.float64)
         sky = meta.sky_bg.astype(np.float64)
         t   = float(meta.transparency)
-        sh  = meta.shift
 
-        # Decompose shift into rotation + integer translation + sub-pixel fraction.
-        # Order: (1) rotate around frame centre, (2) integer-pixel canvas paste,
-        #        (3) sub-pixel Fourier phase-shift.
-        # dx_px / dy_px are in sensor-channel pixel units (half-res for OSC).
-        if sh is not None:
-            dx_total  = sh.dx_px
-            dy_total  = sh.dy_px
-            rot_deg   = sh.rotation_deg   # degrees, CCW, to align with reference
+        is_osc = (cal.ndim == 3)
+        if is_osc:
+            n_ch       = cal.shape[0]
+            data_shape = cal.shape[-2:]   # (H//2, W//2)
+            osc_scale  = 2
         else:
-            dx_total  = 0.0
-            dy_total  = 0.0
-            rot_deg   = 0.0
-
-        dx_int  = int(round(dx_total))
-        dy_int  = int(round(dy_total))
-        dx_frac = dx_total - dx_int
-        dy_frac = dy_total - dy_int
-
-        # OSC path: calibrated is [4, H//2, W//2]; sky is [H//2, W//2].
-        if cal.ndim == 3:
-            n_ch  = cal.shape[0]
-            sub   = cal - sky[np.newaxis, :, :]   # [4, H//2, W//2]
-            # Rotation (applied per-channel; sky rotated once)
-            if abs(rot_deg) >= 0.05:
-                for c in range(n_ch):
-                    sub[c] = _apply_rotation(sub[c], rot_deg)
-                sky = _apply_rotation(sky, rot_deg)
-            # Sub-pixel phase shift
-            if dx_frac != 0.0 or dy_frac != 0.0:
-                for c in range(n_ch):
-                    sub[c] = _apply_phase_shift(sub[c], dx_frac, dy_frac)
-                sky = _apply_phase_shift(sky, dx_frac, dy_frac)
-            sky        = np.stack([sky] * n_ch, axis=0)   # [4, H//2, W//2]
-            data_shape = cal.shape[-2:]                    # (H//2, W//2)
-        else:
-            # Mono path: [H, W]
-            sub = cal - sky
-            if abs(rot_deg) >= 0.05:
-                sub = _apply_rotation(sub, rot_deg)
-                sky = _apply_rotation(sky, rot_deg)
-            if dx_frac != 0.0 or dy_frac != 0.0:
-                sub = _apply_phase_shift(sub, dx_frac, dy_frac)
-                sky = _apply_phase_shift(sky, dx_frac, dy_frac)
-            data_shape = cal.shape             # (H, W)
+            n_ch       = 1
+            data_shape = cal.shape        # (H, W)
+            osc_scale  = 1
 
         if self._shape is None:
             self._shape = data_shape
@@ -673,61 +692,130 @@ class SufficientStatsAccumulator:
                 f"Frame shape {data_shape} differs from expected {self._shape}"
             )
 
-        # Determine canvas shape and sensor origin.
-        # If set_canvas() was called, use the union canvas; otherwise fall back
-        # to the sensor footprint (zero offset, canvas == sensor).
+        # Canvas geometry
         if self._canvas_shape is not None:
             cH, cW = self._canvas_shape
         else:
             cH, cW = data_shape
+        r0, c0 = self._sensor_origin
 
-        r0, c0 = self._sensor_origin   # reference-frame top-left in canvas
-
-        # Lazy initialisation of accumulator arrays on the canvas grid
+        # Lazy initialisation of accumulator arrays
         if self._weighted_sum is None:
-            if cal.ndim == 3:
-                canvas_arr_shape = (n_ch, cH, cW)
-            else:
-                canvas_arr_shape = (cH, cW)
+            canvas_arr_shape = (n_ch, cH, cW) if is_osc else (cH, cW)
             self._weighted_sum = np.zeros(canvas_arr_shape, dtype=np.float64)
             self._weight_sum   = np.zeros(canvas_arr_shape, dtype=np.float64)
             self._sky_sum      = np.zeros(canvas_arr_shape, dtype=np.float64)
             self._sq_sum       = np.zeros(canvas_arr_shape, dtype=np.float64)
 
-        # After rotation scipy keeps output shape = input shape (reshape=False),
-        # so sub/sky are still data_shape even after rotation.  The canvas
-        # placement uses the integer translation only — rotation is already baked
-        # into the pixel values.
-        fr0 = r0 + dy_int
-        fc0 = c0 + dx_int
-        fH, fW = data_shape   # shape of rotated (or unrotated) frame tile
+        # ── Per-channel sky for OSC ───────────────────────────────────────────
+        # sky_bg is estimated from the channel-mean luminance, so it encodes
+        # the *spatial shape* of the sky but at the wrong per-channel level.
+        # For narrowband (Ha→R, OIII→G+B) the per-channel sky levels differ
+        # significantly.  Scale the spatial sky map per channel using each
+        # channel's own median pixel value as the level reference.
+        if is_osc:
+            # sky is [H//2, W//2] — the spatial sky shape at lum-mean level
+            # cal  is [4, H//2, W//2]
+            sky_per_ch = np.empty((n_ch,) + sky.shape, dtype=np.float64)
+            lum_sky_median = float(np.median(sky))
+            for c in range(n_ch):
+                ch_median = float(np.median(cal[c]))
+                scale     = ch_median / lum_sky_median if lum_sky_median > 0 else 1.0
+                sky_per_ch[c] = sky * scale  # [H//2, W//2] — per-channel sky
+        # sky_per_ch only used in the OSC branch below
 
-        # Clamp to canvas bounds (safety — should be exact for correctly computed union)
-        r_src0 = max(0, -fr0);      r_src1 = fH - max(0, fr0 + fH - cH)
-        c_src0 = max(0, -fc0);      c_src1 = fW - max(0, fc0 + fW - cW)
-        r_dst0 = max(0,  fr0);      r_dst1 = r_dst0 + (r_src1 - r_src0)
-        c_dst0 = max(0,  fc0);      c_dst1 = c_dst0 + (c_src1 - c_src0)
+        # ── Warp frame onto canvas ────────────────────────────────────────────
+        # Prefer full WCS affine warp (handles rotation + scale + translation
+        # exactly in one bicubic pass).  Fall back to phase-shift-only when
+        # WCS is unavailable (plate solve failed).
+        use_wcs = (meta.wcs_geom is not None and meta.ref_wcs is not None)
 
-        if r_src1 <= r_src0 or c_src1 <= c_src0:
-            logger.warning("Frame shift places it entirely outside canvas — skipping")
-            return
+        if use_wcs:
+            # Sky-subtract first (sky is in sensor coords)
+            if is_osc:
+                sub_sensor = cal - sky_per_ch   # [4, H//2, W//2] per-channel sky
+            else:
+                sub_sensor = cal - sky          # [H, W]
 
-        if cal.ndim == 3:
-            self._weighted_sum[:, r_dst0:r_dst1, c_dst0:c_dst1] += \
-                t * sub[:, r_src0:r_src1, c_src0:c_src1]
-            self._weight_sum[:, r_dst0:r_dst1, c_dst0:c_dst1] += t
-            self._sky_sum[:, r_dst0:r_dst1, c_dst0:c_dst1] += \
-                sky[:, r_src0:r_src1, c_src0:c_src1]
-            self._sq_sum[:, r_dst0:r_dst1, c_dst0:c_dst1] += \
-                t * sub[:, r_src0:r_src1, c_src0:c_src1] ** 2
+            # Warp each plane to the canvas via full WCS affine transform
+            def warp(plane):
+                return _warp_to_canvas(
+                    plane, meta.wcs_geom, meta.ref_wcs,
+                    (cH, cW), (r0, c0), osc_scale,
+                )
+
+            if is_osc:
+                warped_sub = np.stack([warp(sub_sensor[c]) for c in range(n_ch)])
+                warped_sky = np.stack([warp(sky_per_ch[c]) for c in range(n_ch)])
+            else:
+                warped_sub = warp(sub_sensor)
+                warped_sky = warp(sky)
+
+            # Build a coverage mask: canvas pixels that received data from this frame
+            # (affine_transform fills out-of-bounds with cval=0; use a ones-mask
+            # warped the same way to know where valid data landed)
+            ones = np.ones(data_shape, dtype=np.float64)
+            coverage = _warp_to_canvas(ones, meta.wcs_geom, meta.ref_wcs,
+                                       (cH, cW), (r0, c0), osc_scale)
+            valid = coverage > 0.5   # [cH, cW] bool
+
+            if is_osc:
+                self._weighted_sum[:, valid] += t * warped_sub[:, valid]
+                self._weight_sum[:, valid]   += t
+                self._sky_sum[:, valid]      += warped_sky[:, valid]
+                self._sq_sum[:, valid]       += t * warped_sub[:, valid] ** 2
+            else:
+                self._weighted_sum[valid] += t * warped_sub[valid]
+                self._weight_sum[valid]   += t
+                self._sky_sum[valid]      += warped_sky[valid]
+                self._sq_sum[valid]       += t * warped_sub[valid] ** 2
+
         else:
-            self._weighted_sum[r_dst0:r_dst1, c_dst0:c_dst1] += \
-                t * sub[r_src0:r_src1, c_src0:c_src1]
-            self._weight_sum[r_dst0:r_dst1, c_dst0:c_dst1] += t
-            self._sky_sum[r_dst0:r_dst1, c_dst0:c_dst1] += \
-                sky[r_src0:r_src1, c_src0:c_src1]
-            self._sq_sum[r_dst0:r_dst1, c_dst0:c_dst1] += \
-                t * sub[r_src0:r_src1, c_src0:c_src1] ** 2
+            # Fallback: pure translation (phase-shift), no rotation
+            sh = meta.shift
+            dx_total = sh.dx_px if sh is not None else 0.0
+            dy_total = sh.dy_px if sh is not None else 0.0
+            dx_int = int(round(dx_total));  dx_frac = dx_total - dx_int
+            dy_int = int(round(dy_total));  dy_frac = dy_total - dy_int
+
+            if is_osc:
+                sub = cal - sky_per_ch   # per-channel sky subtraction
+                if dx_frac or dy_frac:
+                    for c in range(n_ch):
+                        sub[c]        = _apply_phase_shift(sub[c], dx_frac, dy_frac)
+                        sky_per_ch[c] = _apply_phase_shift(sky_per_ch[c], dx_frac, dy_frac)
+                sky = sky_per_ch
+            else:
+                sub = cal - sky
+                if dx_frac or dy_frac:
+                    sub = _apply_phase_shift(sub, dx_frac, dy_frac)
+                    sky = _apply_phase_shift(sky, dx_frac, dy_frac)
+
+            fr0 = r0 + dy_int;  fc0 = c0 + dx_int
+            fH, fW = data_shape
+            r_src0 = max(0,-fr0);       r_src1 = fH - max(0, fr0+fH-cH)
+            c_src0 = max(0,-fc0);       c_src1 = fW - max(0, fc0+fW-cW)
+            r_dst0 = max(0, fr0);       r_dst1 = r_dst0 + (r_src1-r_src0)
+            c_dst0 = max(0, fc0);       c_dst1 = c_dst0 + (c_src1-c_src0)
+            if r_src1 <= r_src0 or c_src1 <= c_src0:
+                logger.warning("Frame shift outside canvas — skipping")
+                return
+            if is_osc:
+                self._weighted_sum[:, r_dst0:r_dst1, c_dst0:c_dst1] += \
+                    t * sub[:, r_src0:r_src1, c_src0:c_src1]
+                self._weight_sum[:, r_dst0:r_dst1, c_dst0:c_dst1] += t
+                self._sky_sum[:, r_dst0:r_dst1, c_dst0:c_dst1] += \
+                    sky[:, r_src0:r_src1, c_src0:c_src1]
+                self._sq_sum[:, r_dst0:r_dst1, c_dst0:c_dst1] += \
+                    t * sub[:, r_src0:r_src1, c_src0:c_src1] ** 2
+            else:
+                self._weighted_sum[r_dst0:r_dst1, c_dst0:c_dst1] += \
+                    t * sub[r_src0:r_src1, c_src0:c_src1]
+                self._weight_sum[r_dst0:r_dst1, c_dst0:c_dst1] += t
+                self._sky_sum[r_dst0:r_dst1, c_dst0:c_dst1] += \
+                    sky[r_src0:r_src1, c_src0:c_src1]
+                self._sq_sum[r_dst0:r_dst1, c_dst0:c_dst1] += \
+                    t * sub[r_src0:r_src1, c_src0:c_src1] ** 2
 
         self._shift_list.append(meta.shift)
         self._psf_list.append(meta.psf_total.copy())

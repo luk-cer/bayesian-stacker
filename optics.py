@@ -556,7 +556,9 @@ def compute_frame_shift(
     FrameShift
     """
     H, W = frame_shape
-    cx, cy = W / 2.0, H / 2.0
+    # Use (N-1)/2 to match scipy.ndimage.rotate's rotation centre convention,
+    # so that rotation + translation is geometrically consistent.
+    cx, cy = (W - 1) / 2.0, (H - 1) / 2.0
     offset = min(H, W) / 4.0
 
     # Three test points in the FRAME pixel system
@@ -584,13 +586,12 @@ def compute_frame_shift(
     d_ref   = np.linalg.norm(ref_px[1]  - ref_px[0])
     scale_ratio = float(d_ref / d_frame) if d_frame > 0 else 1.0
 
-    # Rotation angle from the up-offset point
-    vec_frame = test_px[2] - test_px[0]
-    vec_ref   = ref_px[2]  - ref_px[0]
-    angle_frame = float(np.degrees(np.arctan2(vec_frame[1], vec_frame[0])))
-    angle_ref   = float(np.degrees(np.arctan2(vec_ref[1],   vec_ref[0])))
-    rotation_deg = float(angle_ref - angle_frame)
-    # Wrap to [-180, 180]
+    # Rotation angle — derived directly from the CD matrices (position_angle_deg)
+    # rather than from the WCS round-trip vectors, which has poor precision near
+    # 0° and large errors near ±180° (meridian flip).
+    # rotation_deg = how much to rotate the frame content CCW to align with reference.
+    # = reference_PA - frame_PA, wrapped to (-180, 180].
+    rotation_deg = float(wcs_reference.position_angle_deg - wcs_frame.position_angle_deg)
     rotation_deg = (rotation_deg + 180) % 360 - 180
 
     # Shift in arcsec

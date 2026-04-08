@@ -1,13 +1,21 @@
 from bayesian_astro_stacker import BayesianAstroStacker, PipelineConfig
 
 cfg = PipelineConfig(
+    # Optics
     aperture_mm     = 100.0,
     focal_length_mm = 553.0,
     pixel_size_um   = 3.76,
+
+    # MAP solver
     scale_factor    = 2,
-    map_mode        = "fast",   # "fast" (default) or "exact"
-    map_n_iter      = 300,
-    map_alpha_tv    = 5e-3,
+    map_mode        = "fast",       # "fast" (default) or "exact"
+    map_n_iter      = 500,          # increased — previous run hit 300 without converging
+    map_alpha_tv    = 5e-4,
+    map_alpha_kl    = 0.0,
+    map_alpha_wav   = 0.0,
+
+    # Pipeline control
+    force_recompute = False,        # set True to delete all cached files and rerun from scratch
 )
 
 path = "C:/Users/lukas/Downloads/stacker_test/NGC6888-sv220/"

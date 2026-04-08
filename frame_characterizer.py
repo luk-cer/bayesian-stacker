@@ -127,6 +127,8 @@ class FrameMetadata:
     solve_status: str
     frame_path:   Optional[Path]      = None
     calibrated:   Optional[np.ndarray] = None
+    wcs_geom:     Optional[object]    = None   # WCSGeometry of this frame
+    ref_wcs:      Optional[object]    = None   # WCSGeometry of the reference frame
 
     def summary(self) -> str:
         if self.shift is not None:
@@ -151,79 +153,80 @@ class FrameMetadata:
 
 def estimate_sky_background(
     frame:       np.ndarray,
-    poly_degree: int   = 2,
+    poly_degree: int   = 2,   # kept for API compatibility, no longer used
     sigma_clip:  float = 3.0,
     n_iter:      int   = 3,
-    box_size:    int   = 64,
+    box_size:    int   = 128,
 ) -> np.ndarray:
     """
-    Estimate a smooth 2-D sky background.
+    Estimate a smooth 2-D sky background using a tile-median mesh.
 
     Algorithm
     ---------
-    1. Partition the frame into box_size × box_size tiles.
-    2. Compute per-tile median and MAD.
-    3. Reject pixels more than sigma_clip × MAD from their tile median
-       (iterating n_iter times).
-    4. Fit a 2-D Legendre polynomial of degree poly_degree to the surviving
-       (background) pixels using least squares.
-    5. Evaluate the polynomial on the full pixel grid.
+    1. Divide the frame into box_size × box_size tiles.
+    2. Per tile: sigma-clip n_iter times, take the median of survivors.
+    3. Build a coarse mesh of sky estimates at tile centres.
+    4. Bicubic-spline interpolate the mesh back to full resolution.
 
-    Returns
-    -------
-    sky : [H, W] float32
+    Using a local tile median instead of a global polynomial prevents
+    large-scale nebula emission from biasing the sky estimate — a degree-2
+    polynomial fit over a frame with diffuse emission can follow the
+    emission curve and produce a sky that is far too high in the nebula
+    centre, creating a dark "dust-mote-like" depression after subtraction.
     """
+    from scipy.interpolate import RectBivariateSpline
+
     H, W = frame.shape
     f    = frame.astype(np.float64)
 
-    # Build source mask (True = background pixel, keep for fit)
-    mask = np.ones((H, W), dtype=bool)
-    for _ in range(n_iter):
-        n_rows = max(1, H // box_size)
-        n_cols = max(1, W // box_size)
-        for tr in range(n_rows):
-            r0, r1 = tr * box_size, min((tr + 1) * box_size, H)
-            for tc in range(n_cols):
-                c0, c1 = tc * box_size, min((tc + 1) * box_size, W)
-                vals = f[r0:r1, c0:c1][mask[r0:r1, c0:c1]]
+    n_rows = max(2, H // box_size)
+    n_cols = max(2, W // box_size)
+
+    # Tile centres in pixel coordinates
+    row_centres = np.linspace(0, H - 1, n_rows)
+    col_centres = np.linspace(0, W - 1, n_cols)
+
+    mesh = np.zeros((n_rows, n_cols), dtype=np.float64)
+
+    for tr in range(n_rows):
+        r0 = int(round(row_centres[tr] - box_size / 2))
+        r1 = int(round(row_centres[tr] + box_size / 2))
+        r0, r1 = max(0, r0), min(H, r1)
+        for tc in range(n_cols):
+            c0 = int(round(col_centres[tc] - box_size / 2))
+            c1 = int(round(col_centres[tc] + box_size / 2))
+            c0, c1 = max(0, c0), min(W, c1)
+            tile = f[r0:r1, c0:c1].ravel()
+            if tile.size == 0:
+                mesh[tr, tc] = float(np.median(f))
+                continue
+            # Iterative sigma-clip
+            keep = np.ones(tile.size, dtype=bool)
+            for _ in range(n_iter):
+                vals = tile[keep]
                 if vals.size < 4:
-                    continue
+                    break
                 med = float(np.median(vals))
                 mad = float(np.median(np.abs(vals - med))) * 1.4826
                 if mad < 1e-6:
-                    continue
-                lo = med - sigma_clip * mad
-                hi = med + sigma_clip * mad
-                mask[r0:r1, c0:c1] &= (f[r0:r1, c0:c1] >= lo) & \
-                                       (f[r0:r1, c0:c1] <= hi)
+                    break
+                keep &= (tile >= med - sigma_clip * mad) & \
+                        (tile <= med + sigma_clip * mad)
+            survivors = tile[keep]
+            mesh[tr, tc] = float(np.median(survivors)) if survivors.size > 0 \
+                           else float(np.median(tile))
 
-    # Normalised coordinates [-1, 1]
-    Y_g, X_g = np.mgrid[0:H, 0:W]
-    xn = (X_g.astype(np.float64) / max(W - 1, 1)) * 2.0 - 1.0
-    yn = (Y_g.astype(np.float64) / max(H - 1, 1)) * 2.0 - 1.0
-
-    # Legendre polynomial terms  (degree px in x, py in y,  px+py <= poly_degree)
-    terms = []
-    for px in range(poly_degree + 1):
-        for py in range(poly_degree + 1 - px):
-            Lx = np.polynomial.legendre.legval(xn, [0] * px + [1])
-            Ly = np.polynomial.legendre.legval(yn, [0] * py + [1])
-            terms.append(Lx * Ly)
-
-    bg_vals = f[mask]
-    A       = np.column_stack([t[mask] for t in terms])   # [N_bg, N_terms]
-
-    if bg_vals.size <= len(terms):
-        logger.warning("Too few background pixels — returning global median")
-        return np.full((H, W), float(np.median(f)), dtype=np.float32)
-
+    # Interpolate mesh to full resolution
     try:
-        coeffs, *_ = np.linalg.lstsq(A, bg_vals, rcond=None)
-    except np.linalg.LinAlgError:
-        logger.warning("Sky fit failed — returning global median")
-        return np.full((H, W), float(np.median(bg_vals)), dtype=np.float32)
+        spline = RectBivariateSpline(row_centres, col_centres, mesh, kx=3, ky=3)
+        Y_g, X_g = np.mgrid[0:H, 0:W]
+        sky = spline.ev(Y_g.ravel(), X_g.ravel()).reshape(H, W)
+    except Exception:
+        # Fallback: nearest-neighbour upscale via zoom
+        from scipy.ndimage import zoom
+        sky = zoom(mesh, (H / n_rows, W / n_cols), order=1)
+        sky = sky[:H, :W]
 
-    sky = sum(c * t for c, t in zip(coeffs, terms))
     return sky.astype(np.float32)
 
 
@@ -317,20 +320,50 @@ def extract_stars(
         logger.warning("extract_stars: no isolated unsaturated stars found")
         return np.zeros((0, 2), dtype=np.float32), []
 
-    # Sub-pixel centroids (flux-weighted 5×5 window on sky-subtracted frame)
+    # Sub-pixel centroids — prefer SEP windowed CoG (WCoG), fall back to 5×5 CoG
+    _sep_available = False
+    _sep_data      = None
+    _sep_rms       = None
+    try:
+        import sep as _sep
+        # SEP requires native byte order
+        _sep_data = sub.astype(np.float64)
+        if _sep_data.dtype.byteorder not in ('=', '<', '|'):
+            _sep_data = _sep_data.byteswap().newbyteorder()
+        # Use sky_rms as uniform error estimate; sep.winpos needs a scalar or array
+        _sep_rms       = sky_rms
+        _sep_available = True
+    except Exception:
+        pass
+
     positions: List[List[float]] = []
     stamps:    List[np.ndarray]  = []
     for y, x in zip(kept_y, kept_x):
-        wy0, wy1 = max(0, y - 2), min(H, y + 3)
-        wx0, wx1 = max(0, x - 2), min(W, x + 3)
-        win  = sub[wy0:wy1, wx0:wx1]
-        norm = float(win.clip(min=0).sum())
-        if norm > 0:
-            yy, xx = np.mgrid[wy0:wy1, wx0:wx1].astype(np.float64)
-            cy = float((yy * win.clip(min=0)).sum() / norm)
-            cx = float((xx * win.clip(min=0)).sum() / norm)
-        else:
-            cy, cx = float(y), float(x)
+        # --- WCoG via SEP ---
+        cy, cx = float(y), float(x)
+        if _sep_available:
+            try:
+                xw, yw, flag = _sep.winpos(
+                    _sep_data,
+                    np.array([float(x)], dtype=np.float64),
+                    np.array([float(y)], dtype=np.float64),
+                    sig=2.5,
+                )
+                if int(flag[0]) == 0:
+                    cy, cx = float(yw[0]), float(xw[0])
+            except Exception:
+                pass  # fall through to CoG below
+
+        # --- Fallback: flux-weighted 5×5 CoG ---
+        if (cy == float(y) and cx == float(x)):
+            wy0, wy1 = max(0, y - 2), min(H, y + 3)
+            wx0, wx1 = max(0, x - 2), min(W, x + 3)
+            win  = sub[wy0:wy1, wx0:wx1]
+            norm = float(win.clip(min=0).sum())
+            if norm > 0:
+                yy, xx = np.mgrid[wy0:wy1, wx0:wx1].astype(np.float64)
+                cy = float((yy * win.clip(min=0)).sum() / norm)
+                cx = float((xx * win.clip(min=0)).sum() / norm)
 
         r0, r1 = y - half, y - half + stamp_size
         c0, c1 = x - half, x - half + stamp_size
@@ -341,8 +374,9 @@ def extract_stars(
         stamps.append(sub[r0:r1, c0:c1].astype(np.float32))
 
     logger.info(
-        "extract_stars: %d stars  (SNR > %.0f, sep > %.0f px)",
+        "extract_stars: %d stars  (SNR > %.0f, sep > %.0f px, centroid=%s)",
         len(positions), snr_threshold, min_sep_px,
+        "WCoG" if _sep_available else "CoG",
     )
     if not positions:
         return np.zeros((0, 2), dtype=np.float32), []
@@ -742,7 +776,27 @@ class FrameCharacterizer:
         """
         fits_path = Path(fits_path)
         raw, header = self._load(fits_path)
-        cal         = model.calibrate_frame(raw, exposure_s)
+
+        # Determine camera rotation relative to the reference frame so that
+        # calibrate_frame() can rotate the master flat to match.  A meridian
+        # flip (|rotation| > 90°) would put dust motes at mirror positions
+        # relative to the flat — rotating the flat 180° corrects this.
+        rotation_for_flat = 0.0
+        if not is_reference and self._ref_wcs is not None:
+            try:
+                wcs_geom_pre, _ = self._extract_wcs(header)
+                if wcs_geom_pre is not None:
+                    raw_rot = float(
+                        self._ref_wcs.position_angle_deg
+                        - wcs_geom_pre.position_angle_deg
+                    )
+                    # Wrap to (-180, 180]
+                    rotation_for_flat = (raw_rot + 180.0) % 360.0 - 180.0
+            except Exception:
+                pass
+
+        cal = model.calibrate_frame(raw, exposure_s,
+                                    rotation_deg=rotation_for_flat)
         return self.characterize_calibrated(
             cal, header, exposure_s,
             is_reference=is_reference,
@@ -830,7 +884,7 @@ class FrameCharacterizer:
         wcs_geom, solve_status = self._extract_wcs(header)
         is_osc_frame = (calibrated.ndim == 3)
         full_shape = (lum.shape[0] * 2, lum.shape[1] * 2) if is_osc_frame else lum.shape
-        shift = self._compute_shift(wcs_geom, full_shape, is_reference)
+        shift = self._compute_shift(wcs_geom, full_shape, is_reference, positions)
         if shift is not None and is_osc_frame:
             # Re-express shift in half-resolution (Bayer-channel) pixel units
             from optics import FrameShift as _FrameShift
@@ -861,6 +915,8 @@ class FrameCharacterizer:
             solve_status = solve_status,
             frame_path   = frame_path,
             calibrated   = calibrated,
+            wcs_geom     = wcs_geom,
+            ref_wcs      = self._ref_wcs,
         )
         logger.info(
             "%s → t=%.3f  FWHM=%.2f\"  n_stars=%d  solve=%s",
@@ -896,23 +952,55 @@ class FrameCharacterizer:
 
     def _compute_shift(
         self,
-        wcs_geom:     Optional[object],
-        frame_shape:  Tuple[int, int],
-        is_reference: bool,
+        wcs_geom:        Optional[object],
+        frame_shape:     Tuple[int, int],
+        is_reference:    bool,
+        frame_positions: Optional[np.ndarray] = None,
     ) -> Optional[object]:
         if is_reference:
             if wcs_geom is not None:
                 self._ref_wcs = wcs_geom
             return None   # reference frame defines zero shift
-        if wcs_geom is None or self._ref_wcs is None:
-            return None
-        if not _OPTICS_OK:
-            return None
-        try:
-            return compute_frame_shift(wcs_geom, self._ref_wcs, frame_shape)
-        except Exception as exc:
-            logger.warning("Shift computation failed: %s", exc)
-            return None
+
+        # --- Primary path: WCS plate-solve ---
+        if wcs_geom is not None and self._ref_wcs is not None and _OPTICS_OK:
+            try:
+                return compute_frame_shift(wcs_geom, self._ref_wcs, frame_shape)
+            except Exception as exc:
+                logger.warning("WCS shift computation failed: %s", exc)
+
+        # --- Fallback: triangle matching + MAGSAC++ ---
+        if (self._ref_positions is not None
+                and frame_positions is not None
+                and len(self._ref_positions) >= 3
+                and len(frame_positions) >= 3):
+            try:
+                from star_align import match_stars, fit_similarity_magsac
+                from optics import FrameShift as _FrameShift
+                ref_pts, frm_pts = match_stars(self._ref_positions, frame_positions)
+                if len(ref_pts) >= 6:
+                    result = fit_similarity_magsac(ref_pts, frm_pts)
+                    if result is not None:
+                        dx, dy, rot, scale = result
+                        plate = (self.scope.plate_scale_arcsec_per_px
+                                 if _OPTICS_OK else 1.0)
+                        logger.info(
+                            "Image-based alignment: dx=%.2fpx dy=%.2fpx "
+                            "rot=%.3fdeg scale=%.5f",
+                            dx, dy, rot, scale,
+                        )
+                        return _FrameShift(
+                            dx_px        = dx,
+                            dy_px        = dy,
+                            dx_arcsec    = dx * plate,
+                            dy_arcsec    = dy * plate,
+                            rotation_deg = rot,
+                            scale_ratio  = scale,
+                        )
+            except Exception as exc:
+                logger.warning("Image-based shift computation failed: %s", exc)
+
+        return None
 
     def _build_psf(
         self, stamps: List[np.ndarray]

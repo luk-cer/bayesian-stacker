@@ -710,8 +710,23 @@ class InstrumentModel:
                         acc.update(frame, exp_time)
                     except Exception as exc:
                         logger.warning("Skipping %s: %s", path.name, exc)
-            slope, _intercept, _residual_std = acc.finalize()
-            self.dark_rate = np.maximum(slope, 0.0).astype(np.float32)
+            slope, intercept, _residual_std = acc.finalize()
+            if abs(acc._Stt) < 1e-12:
+                # All darks at the same exposure time — slope is zero.
+                # Use mean_dark / t so that dark_rate * t = master_dark.
+                t_common = acc._t_mean
+                if t_common > 0:
+                    logger.info(
+                        "fit_dark: single exposure time (%.0f s) — using "
+                        "mean_dark / t as dark_rate", t_common
+                    )
+                    self.dark_rate = np.maximum(
+                        intercept / t_common, 0.0
+                    ).astype(np.float32)
+                else:
+                    self.dark_rate = np.zeros(slope.shape, dtype=np.float32)
+            else:
+                self.dark_rate = np.maximum(slope, 0.0).astype(np.float32)
             n = acc.n
 
         # Hot pixel mask — always from MAD threshold on dark_rate
@@ -1052,7 +1067,8 @@ class InstrumentModel:
 
     def calibrate_frame(self,
                         raw: np.ndarray,
-                        exposure_time: float) -> np.ndarray:
+                        exposure_time: float,
+                        rotation_deg: float = 0.0) -> np.ndarray:
         """
         Apply bias subtraction, dark subtraction, and flat division to one
         raw light frame.
@@ -1061,6 +1077,11 @@ class InstrumentModel:
         ----------
         raw           : [H, W] array of raw ADU counts (any numeric dtype)
         exposure_time : exposure duration in seconds
+        rotation_deg  : frame orientation relative to flats in degrees.
+                        When |rotation_deg| > 90 (meridian flip) the flat_gain
+                        map is rotated 180° before division so that dust motes
+                        at their sensor positions in the flat correctly cancel
+                        the same dust motes in the flipped light frame.
 
         Returns
         -------
@@ -1076,11 +1097,73 @@ class InstrumentModel:
         if self.dark_rate  is not None:
             frame -= self.dark_rate * float(exposure_time)
         if self.flat_gain  is not None:
-            safe_gain = np.where(self.flat_gain > 0.01, self.flat_gain, 1.0)
+            flat = self.flat_gain
+            if abs(rotation_deg) > 90.0:
+                # Meridian-flipped frame: camera is rotated ~180° relative to
+                # when flats were taken.  Rotate the master flat 180° so dust
+                # motes align with their positions in this light frame.
+                flat = np.rot90(flat, k=2)
+            safe_gain = np.where(flat > 0.01, flat, 1.0)
             frame    /= safe_gain
+
+        # ── Hot pixel replacement ─────────────────────────────────────────────
+        # Replace known hot pixels (from dark_rate MAD mask) plus any
+        # remaining per-channel outliers (>10 sigma above local median) with
+        # a 5×5 median of their neighbourhood.  Done on the full Bayer mosaic
+        # so that the 2×2 colour grid is respected — each pixel is only
+        # compared to and replaced by pixels of the same colour.
+        frame = self._replace_hot_pixels(frame)
+
         if self._is_osc():
             planes, _ = bayer_split(frame, self.bayer_pattern)
             return planes  # [4, H//2, W//2]
+        return frame
+
+    def _replace_hot_pixels(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Replace hot / cosmic-ray pixels with a local 5×5 median.
+
+        Two passes:
+        1. Known hot pixels from self.hot_pixel_mask (derived from darks).
+        2. Per-channel sigma-clip: pixels > median + 10*MAD replaced.
+           For OSC this operates on each Bayer sub-grid independently
+           so green-channel noise doesn't mask red/blue outliers.
+        """
+        from scipy.ndimage import median_filter
+        frame = frame.copy()
+
+        # Pass 1 — dark-based mask (full-res mosaic coordinates)
+        if self.hot_pixel_mask is not None:
+            if frame.shape == self.hot_pixel_mask.shape:
+                mask = self.hot_pixel_mask
+                if mask.any():
+                    smoothed = median_filter(frame, size=5)
+                    frame[mask] = smoothed[mask]
+
+        # Pass 2 — per-channel sigma-clip on each Bayer sub-grid (or full
+        # frame for mono).  Operates on 2×2 sub-sampled grids for OSC so
+        # each channel is compared only to same-colour neighbours.
+        if self._is_osc():
+            offsets = _BAYER_OFFSETS[self.bayer_pattern]
+            for ch, (r0, c0) in offsets.items():
+                sub = frame[r0::2, c0::2]
+                med = float(np.median(sub))
+                mad = float(np.median(np.abs(sub - med))) * 1.4826
+                threshold = med + 10.0 * mad
+                hot = sub > threshold
+                if hot.any():
+                    smoothed_sub = median_filter(sub, size=5)
+                    sub[hot] = smoothed_sub[hot]
+                    frame[r0::2, c0::2] = sub
+        else:
+            med = float(np.median(frame))
+            mad = float(np.median(np.abs(frame - med))) * 1.4826
+            threshold = med + 10.0 * mad
+            hot = frame > threshold
+            if hot.any():
+                smoothed = median_filter(frame, size=5)
+                frame[hot] = smoothed[hot]
+
         return frame
 
     # ==========================================================================

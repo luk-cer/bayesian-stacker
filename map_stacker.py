@@ -361,7 +361,7 @@ class MapResult:
         else:
             data = self.lambda_hr
 
-        primary = fits.PrimaryHDU(data, header=hdr)
+        primary = fits.PrimaryHDU(data.astype(np.float32), header=hdr)
         hdul    = fits.HDUList([primary])
 
         if quality_map is not None:
@@ -377,7 +377,7 @@ class MapResult:
                 q_hr = _upsample_numpy(qm, self.config.scale_factor)
                 if bayer_pattern is not None and q_hr.ndim == 2:
                     q_planes, _ = bayer_split(q_hr, bayer_pattern)
-                    hdul.append(fits.ImageHDU(q_planes, name="QUALITY"))
+                    hdul.append(fits.ImageHDU(q_planes.astype(np.float32), name="QUALITY"))
                 else:
                     hdul.append(fits.ImageHDU(q_hr.astype(np.float32), name="QUALITY"))
 
@@ -400,16 +400,27 @@ class MapResult:
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
         iters = np.arange(1, len(self.loss_history) + 1) * self.config.log_every
 
-        ax1.semilogy(iters, self.loss_history, lw=1.5, color="steelblue")
+        loss = np.array(self.loss_history, dtype=np.float64)
+        if loss.min() <= 0:
+            # Shift so all values are positive before log-scaling.
+            # If all negative (typical for Poisson NLL), negate so the plot
+            # shows decreasing loss as descending curve.
+            if loss.max() <= 0:
+                loss = -loss   # all negative → flip sign, curve goes down
+            else:
+                loss = loss - loss.min() + 1.0  # mixed → shift above zero
+        ax1.semilogy(iters, loss, lw=1.5, color="steelblue")
         ax1.set_xlabel("Iteration")
-        ax1.set_ylabel("Loss (log scale)")
+        ax1.set_ylabel("Loss (log scale, negated)" if self.loss_history[0] < 0 else "Loss (log scale)")
         ax1.set_title("Convergence")
         ax1.grid(True, alpha=0.3)
         if self.converged:
             ax1.axvline(self.n_iter, color="red", ls="--", lw=1, label="converged")
             ax1.legend(fontsize=9)
 
-        ax2.semilogy(iters, self.grad_norm_history, lw=1.5, color="darkorange")
+        grad = np.array(self.grad_norm_history, dtype=np.float64)
+        grad = np.where(grad > 0, grad, grad.max() * 1e-10 if grad.max() > 0 else 1e-10)
+        ax2.semilogy(iters, grad, lw=1.5, color="darkorange")
         ax2.set_xlabel("Iteration")
         ax2.set_ylabel("Gradient L2-norm")
         ax2.set_title("Gradient norm")
@@ -563,11 +574,13 @@ def forward_model_numpy(
     dy:        float,
     scale:     int,
     transparency: float = 1.0,
+    rotation_deg: float = 0.0,
+    scale_ratio:  float = 1.0,
 ) -> np.ndarray:
     """
     Apply the full forward model to produce the expected LR observation.
 
-        λ_lr = t · AvgPool(PSF ⊛ PhaseShift(λ_hr, dx, dy))
+        λ_lr = t · AvgPool(PSF ⊛ PhaseShift(AffineWarp(λ_hr), dx, dy))
 
     Parameters
     ----------
@@ -576,13 +589,26 @@ def forward_model_numpy(
     dx, dy       : frame shift in native (LR) pixels
     scale        : upscaling factor
     transparency : per-frame throughput t_i
+    rotation_deg : CCW rotation to apply to λ_hr before shift (spatial)
+    scale_ratio  : uniform scale to apply to λ_hr before shift (spatial)
 
     Returns
     -------
     lambda_lr : [H, W] float64 — expected LR pixel values
     """
-    shifted  = _phase_shift_numpy(lambda_hr, dx, dy, scale)
-    convolved = _convolve_psf_numpy(shifted, psf)
+    # Rotation + scale warp (spatial, before frequency-domain phase shift)
+    if abs(rotation_deg) > 1e-4 or abs(scale_ratio - 1.0) > 1e-5:
+        from scipy.ndimage import affine_transform as _affine_transform
+        s = 1.0 / scale_ratio
+        r = math.radians(-rotation_deg)
+        A = s * np.array([[math.cos(r), -math.sin(r)],
+                           [math.sin(r),  math.cos(r)]])
+        cy = (lambda_hr.shape[0] - 1) / 2.0
+        cx = (lambda_hr.shape[1] - 1) / 2.0
+        offset = np.array([cy, cx]) - A @ np.array([cy, cx])
+        lambda_hr = _affine_transform(lambda_hr, A, offset=offset, order=1, cval=0.0)
+    shifted     = _phase_shift_numpy(lambda_hr, dx, dy, scale)
+    convolved   = _convolve_psf_numpy(shifted, psf)
     downsampled = _downsample_numpy(convolved, scale)
     return transparency * np.maximum(downsampled, 0.0)
 
@@ -642,6 +668,52 @@ def _build_phase_ramp(
     return torch.exp(-2j * math.pi * (fy * dy_hr + fx * dx_hr))
 
 
+def _build_affine_grid(
+    rotation_deg: float,
+    scale_ratio:  float,
+    sH: int,
+    sW: int,
+    device: "torch.device",
+) -> "Optional[torch.Tensor]":
+    """
+    Build a grid_sample flow field for rotation + uniform scale centred at
+    image centre.  Returns [1, sH, sW, 2] float32 tensor, or None if the
+    transform is effectively the identity.
+
+    rotation_deg : CCW rotation to apply (positive = CCW)
+    scale_ratio  : uniform scale factor to apply
+    """
+    if abs(rotation_deg) < 1e-4 and abs(scale_ratio - 1.0) < 1e-5:
+        return None
+    theta_rad = math.radians(rotation_deg)
+    s = float(scale_ratio)
+    # [2, 3] affine matrix in normalised [-1,1] coords (grid_sample convention)
+    M = torch.tensor(
+        [[s * math.cos(theta_rad), -s * math.sin(theta_rad), 0.0],
+         [s * math.sin(theta_rad),  s * math.cos(theta_rad), 0.0]],
+        dtype=torch.float32, device=device,
+    ).unsqueeze(0)  # [1, 2, 3]
+    grid = F.affine_grid(M, size=(1, 1, sH, sW), align_corners=False)  # [1,sH,sW,2]
+    return grid
+
+
+def _apply_affine_grid(
+    lam:  "torch.Tensor",           # [sH, sW]
+    grid: "Optional[torch.Tensor]", # [1, sH, sW, 2] or None
+) -> "torch.Tensor":
+    """Apply a precomputed affine grid to a [sH, sW] tensor. Returns [sH, sW]."""
+    if grid is None:
+        return lam
+    warped = F.grid_sample(
+        lam.unsqueeze(0).unsqueeze(0),  # [1, 1, sH, sW]
+        grid,                            # [1, sH, sW, 2]
+        mode='bilinear',
+        padding_mode='zeros',
+        align_corners=False,
+    )
+    return warped.squeeze(0).squeeze(0)  # [sH, sW]
+
+
 def _forward_single(
     theta:       "torch.Tensor",   # [sH, sW]  unconstrained parameterisation
     psf_spec:    "torch.Tensor",   # rfft2 spectrum of padded PSF
@@ -650,14 +722,21 @@ def _forward_single(
     transparency: float,
     pH: int,
     pW: int,
+    affine_grid: "Optional[torch.Tensor]" = None,  # rotation+scale grid or None
 ) -> "torch.Tensor":
     """
     Single-frame forward model in PyTorch.
 
-    θ → λ = softplus(θ) → shift → PSF conv → downsample → t·λ_lr
+    θ → λ = softplus(θ) → AffineWarp(rot,scale) → PhaseShift(freq) → PSF conv → downsample → t·λ_lr
+
+    Rotation+scale are applied spatially (grid_sample) before the FFT.
+    Translation remains in frequency domain (phase ramp) — exact and alias-free.
     """
     # Reparameterisation: ensure λ > 0
     lam = F.softplus(theta)                                   # [sH, sW]
+
+    # Rotation + scale warp (spatial, before FFT).  No-op when affine_grid is None.
+    lam = _apply_affine_grid(lam, affine_grid)                # [sH, sW]
 
     sH, sW = lam.shape
 
@@ -868,31 +947,44 @@ def _solve_fast(
     S      = config.scale_factor
     sH, sW = H * S, W * S
 
-    # ---- Build mean PSF ----------------------------------------------------
-    psf_arr  = np.stack(stats.psf_list, axis=0).mean(axis=0)  # [K, K]
-    psf_arr /= psf_arr.sum()
+    N = stats.frame_count
 
-    # ---- Observed proxy: weighted_sum / weight_sum -------------------------
-    # The proxy observation is the transparency-weighted mean frame.
-    # We treat it as an observation with Poisson rate = D(H̄ ⊛ λ_hr).
-    # The total "effective exposure" is median(weight_sum).
-    obs_lr      = stats.weighted_sum.astype(np.float32)      # [H, W] — observation
-    w_eff       = float(np.median(stats.weight_sum))         # effective weight scalar
+    # ---- Observed proxy: weighted_sum ----------------------------------------
+    # obs_t is the t_i²-weighted sum of frames (see sufficient_statistics.py).
+    # The forward model predicts: Σ t_i² · D(PSF_i ⊛ AffineWarp_i(PhaseShift_i(λ_hr)))
+    obs_lr  = stats.weighted_sum.astype(np.float32)          # [H, W]
+
+    # ---- FFT padding: use max PSF size across frames -----------------------
+    psf_max = max(p.shape[0] for p in stats.psf_list)
+    pH = _next_power_of_2(sH + psf_max)
+    pW = _next_power_of_2(sW + psf_max)
+
+    # ---- Per-frame caches (precomputed once, before the optimisation loop) -
+    psf_specs: List["torch.Tensor"]   = []
+    phase_ramps: List["torch.Tensor"] = []
+    affine_grids: List               = []
+    t_list: List[float]               = stats.transparency_list
+
+    for i in range(N):
+        psf_i = stats.psf_list[i].astype(np.float32)
+        psf_i /= psf_i.sum()
+        psf_specs.append(_make_psf_spectrum(psf_i, pH, pW, dev))
+
+        sh = stats.shift_list[i]
+        dx_i = sh.dx_px       if sh is not None else 0.0
+        dy_i = sh.dy_px       if sh is not None else 0.0
+        rot_i = -(sh.rotation_deg  if sh is not None else 0.0)
+        sc_i  = 1.0 / (sh.scale_ratio if (sh is not None and sh.scale_ratio > 0) else 1.0)
+        phase_ramps.append(_build_phase_ramp(dx_i, dy_i, pH, pW, S, dev))
+        affine_grids.append(_build_affine_grid(rot_i, sc_i, sH, sW, dev))
 
     # ---- Initialise λ on HR grid -------------------------------------------
     prior_hr = _build_prior(stats.weighted_mean, S)          # [sH, sW]
     theta_np = _theta_init(prior_hr)                         # [sH, sW]
 
-    theta     = torch.tensor(theta_np,        device=dev, requires_grad=True)
-    obs_t     = torch.tensor(obs_lr,          device=dev)
-    prior_t   = torch.tensor(prior_hr,        device=dev)
-
-    # ---- FFT padding sizes -------------------------------------------------
-    pH = _next_power_of_2(sH + psf_arr.shape[0])
-    pW = _next_power_of_2(sW + psf_arr.shape[0])
-
-    psf_spec    = _make_psf_spectrum(psf_arr, pH, pW, dev)   # cached
-    zero_ramp   = _build_phase_ramp(0.0, 0.0, pH, pW, S, dev)  # no shift
+    theta   = torch.tensor(theta_np, device=dev, requires_grad=True)
+    obs_t   = torch.tensor(obs_lr,   device=dev)
+    prior_t = torch.tensor(prior_hr, device=dev)
 
     # ---- Optimiser + scheduler --------------------------------------------
     opt  = torch.optim.Adam([theta], lr=config.lr)
@@ -913,13 +1005,17 @@ def _solve_fast(
 
         lam_hr   = F.softplus(theta)                                # [sH, sW]
 
-        # Forward model
-        lam_lr   = _forward_single(
-            theta, psf_spec, zero_ramp, S, w_eff, pH, pW
-        )                                                           # [H, W]
+        # Per-frame forward model: Σ t_i² · D(PSF_i ⊛ AffineWarp_i(PhaseShift_i(λ_hr)))
+        predicted_sum = torch.zeros_like(obs_t)
+        for i in range(N):
+            t_i = t_list[i]
+            predicted_sum = predicted_sum + t_i * t_i * _forward_single(
+                theta, psf_specs[i], phase_ramps[i], S, 1.0, pH, pW,
+                affine_grid=affine_grids[i],
+            )
 
         # ---- Data loss
-        loss = _poisson_nll_torch(obs_t, lam_lr)
+        loss = _poisson_nll_torch(obs_t, predicted_sum)
 
         # ---- TV
         if config.alpha_tv > 0:
@@ -1008,8 +1104,9 @@ def _solve_exact(
     theta    = torch.tensor(theta_np,  device=dev, requires_grad=True)
     prior_t  = torch.tensor(prior_hr,  device=dev)
 
-    psf_specs: List["torch.Tensor"]  = []
+    psf_specs: List["torch.Tensor"]   = []
     phase_ramps: List["torch.Tensor"] = []
+    affine_grids: List                = []
 
     # All PSFs use the same padding for simplicity — use the max
     psf_max = max(p.shape[0] for p in stats.psf_list)
@@ -1022,9 +1119,12 @@ def _solve_exact(
         psf_specs.append(_make_psf_spectrum(psf, pH, pW, dev))
 
         sh = stats.shift_list[i]
-        dx = sh.dx_px if sh is not None else 0.0
-        dy = sh.dy_px if sh is not None else 0.0
+        dx  = sh.dx_px        if sh is not None else 0.0
+        dy  = sh.dy_px        if sh is not None else 0.0
+        rot = -(sh.rotation_deg  if sh is not None else 0.0)
+        sc  = 1.0 / (sh.scale_ratio if (sh is not None and sh.scale_ratio > 0) else 1.0)
         phase_ramps.append(_build_phase_ramp(dx, dy, pH, pW, S, dev))
+        affine_grids.append(_build_affine_grid(rot, sc, sH, sW, dev))
 
     opt   = torch.optim.Adam([theta], lr=config.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -1064,7 +1164,8 @@ def _solve_exact(
 
             # Forward model
             lam_lr = _forward_single(
-                theta, psf_specs[i], phase_ramps[i], S, t_i, pH, pW
+                theta, psf_specs[i], phase_ramps[i], S, t_i, pH, pW,
+                affine_grid=affine_grids[i],
             )
 
             batch_loss = batch_loss + _poisson_nll_torch(obs_t, lam_lr)

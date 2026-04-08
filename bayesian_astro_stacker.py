@@ -189,6 +189,11 @@ class PipelineConfig:
         Write convergence loss-curve PNG.  Default: True.
     overwrite : bool
         Overwrite existing output files.  Default: True.
+    force_recompute : bool
+        Delete all cached outputs (instrument_model.h5, bayes_state.h5,
+        sufficient_stats.h5, stats_checkpoint.h5, fast_stack.fits,
+        lambda_hr.fits) before running, forcing a full recompute from
+        raw frames.  Default: False.
     """
     # Instrument
     aperture_mm:      float = 100.0
@@ -222,6 +227,7 @@ class PipelineConfig:
     save_fast_stack:       bool = True
     save_convergence_plot: bool = True
     overwrite:             bool = True
+    force_recompute:       bool = False
 
 
 # ============================================================================
@@ -323,61 +329,68 @@ class PipelineResult:
 # Union bounding-box helper
 # ============================================================================
 
-def _rotated_frame_bbox(H: int, W: int, angle_deg: float) -> tuple:
-    """Axis-aligned bounding box of an H×W frame rotated by angle_deg degrees."""
-    if abs(angle_deg) < 0.05:
-        return H, W
-    rad = np.radians(angle_deg)
-    cos_a, sin_a = abs(np.cos(rad)), abs(np.sin(rad))
-    return int(np.ceil(H * cos_a + W * sin_a)), int(np.ceil(W * cos_a + H * sin_a))
-
-
 def _compute_union_canvas(
     sensor_shape: tuple,
-    shifts: list,
+    metas: list,
+    osc_scale:    int = 1,
 ) -> tuple:
     """
-    Compute the union bounding box of all shifted and rotated frames.
+    Compute the union bounding box of all frames using full WCS projections.
+
+    For each frame the four corner pixels are projected through the frame WCS
+    to sky coordinates, then back through the reference WCS to find where they
+    land in the reference pixel system.  The axis-aligned bounding box of all
+    such projected corners gives the exact union canvas.
+
+    Falls back to shift-only bounding box for frames whose WCS is unavailable.
 
     Parameters
     ----------
-    sensor_shape : (H, W)
-        Pixel dimensions of a single frame (channel/accumulation grid,
-        half-res for OSC).
-    shifts : list of FrameShift or None
-        Per-frame shifts in sensor-channel pixel units.  None = zero shift.
+    sensor_shape : (H, W)  per-channel pixel dimensions (half-res for OSC)
+    metas        : list of FrameMetadata — must include wcs_geom / ref_wcs
+    osc_scale    : 2 for OSC (sensor coords are half of full-frame coords)
 
     Returns
     -------
-    canvas_shape  : (cH, cW)  — union bounding box size
-    sensor_origin : (r0, c0)  — where the reference frame's top-left sits
-                                in the canvas (always >= 0)
+    canvas_shape  : (cH, cW)
+    sensor_origin : (r0, c0) — reference frame top-left in canvas
     """
     H, W = sensor_shape
+    all_rows, all_cols = [], []
 
-    row_mins, row_maxs = [], []
-    col_mins, col_maxs = [], []
+    for meta in metas:
+        if meta.wcs_geom is not None and meta.ref_wcs is not None:
+            # Project all 4 corners of this frame onto the reference pixel grid
+            corners_frame = [(0, 0), (W-1, 0), (0, H-1), (W-1, H-1)]
+            for fc, fr in corners_frame:
+                # Frame array coords → full-frame pixel coords
+                sky = meta.wcs_geom.wcs.pixel_to_world(
+                    float(fc) * osc_scale, float(fr) * osc_scale)
+                rx, ry = meta.ref_wcs.wcs.world_to_pixel(sky)
+                # Reference full-frame pixel → canvas channel coords
+                all_rows.append(float(ry) / osc_scale)
+                all_cols.append(float(rx) / osc_scale)
+        else:
+            # Fallback: use integer shift only
+            sh = meta.shift
+            dy = int(round(sh.dy_px)) if sh is not None else 0
+            dx = int(round(sh.dx_px)) if sh is not None else 0
+            all_rows += [dy, dy + H - 1]
+            all_cols += [dx, dx + W - 1]
 
-    for sh in shifts:
-        dy_int  = int(round(sh.dy_px))   if sh is not None else 0
-        dx_int  = int(round(sh.dx_px))   if sh is not None else 0
-        rot_deg = sh.rotation_deg        if sh is not None else 0.0
-        fH, fW  = _rotated_frame_bbox(H, W, rot_deg)
-        # Rotation expands the bbox symmetrically around the frame centre;
-        # top-left corner shifts by half the expansion.
-        r_pad   = (fH - H) // 2
-        c_pad   = (fW - W) // 2
-        r0f     = dy_int - r_pad
-        c0f     = dx_int - c_pad
-        row_mins.append(r0f);       row_maxs.append(r0f + fH)
-        col_mins.append(c0f);       col_maxs.append(c0f + fW)
+    # Reference frame corners are always at (0..W-1, 0..H-1) in reference coords
+    all_rows += [0.0, float(H - 1)]
+    all_cols += [0.0, float(W - 1)]
 
-    row_min = min(row_mins)
-    col_min = min(col_mins)
-    cH = max(row_maxs) - row_min
-    cW = max(col_maxs) - col_min
+    row_min = int(np.floor(min(all_rows)))
+    row_max = int(np.ceil( max(all_rows)))
+    col_min = int(np.floor(min(all_cols)))
+    col_max = int(np.ceil( max(all_cols)))
 
-    # Reference frame's top-left in canvas coords
+    cH = row_max - row_min + 1
+    cW = col_max - col_min + 1
+
+    # Reference frame top-left in canvas coords
     r0 = -row_min
     c0 = -col_min
 
@@ -438,6 +451,23 @@ class BayesianAstroStacker:
         light_dir  = Path(light_dir)
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+
+        # ── Force recompute: delete all cached files ─────────────────────
+        if cfg.force_recompute:
+            _CACHE_FILES = [
+                "instrument_model.h5",
+                "bayes_state.h5",
+                "sufficient_stats.h5",
+                "stats_checkpoint.h5",
+                "fast_stack.fits",
+                "lambda_hr.fits",
+                "convergence.png",
+            ]
+            for fname in _CACHE_FILES:
+                p = output_dir / fname
+                if p.exists():
+                    p.unlink()
+                    logger.info("force_recompute: deleted %s", p)
 
         # ── Phase 0: calibration ─────────────────────────────────────────
         model = self._phase0_calibration(
@@ -700,43 +730,32 @@ class BayesianAstroStacker:
                     f"{'OSC' if is_osc_batch else 'mono'}."
                 )
 
-            # Quality filter
-            if meta.transparency < cfg.min_transparency:
-                logger.debug("Reject %s: transparency=%.3f < %.3f",
-                             path.name, meta.transparency, cfg.min_transparency)
-                n_rejected += 1
-                continue
-            if (meta.fwhm_arcsec or 0.) > cfg.max_fwhm_arcsec:
-                logger.debug("Reject %s: FWHM=%.2f\" > %.2f\"",
-                             path.name, meta.fwhm_arcsec, cfg.max_fwhm_arcsec)
-                n_rejected += 1
-                continue
-
+            # All frames accepted — transparency and FWHM are used as weights
+            # by the MAP solver, not as hard rejection criteria.  A blurrier
+            # or dimmer frame contributes less signal automatically through its
+            # PSF kernel and transparency weight; discarding it throws away
+            # real photons.
             accepted.append((meta.calibrated, meta))
             logger.info(
-                "Pass1 frame %3d/%d  t=%.3f  FWHM=%.2f\"  accepted=%d  rejected=%d",
+                "Pass1 frame %3d/%d  t=%.3f  FWHM=%.2f\"  accepted=%d",
                 i+1, len(light_paths),
                 meta.transparency, meta.fwhm_arcsec or 0.,
-                len(accepted), n_rejected,
+                len(accepted),
             )
 
         if not accepted:
-            raise RuntimeError(
-                "No frames passed quality filtering.  "
-                "Lower min_transparency or max_fwhm_arcsec."
-            )
+            raise RuntimeError("No frames could be characterised.")
 
         # ── Compute union bounding box ──────────────────────────────────────
-        # sensor_shape is the per-channel pixel dimensions:
-        #   OSC → (H//2, W//2);  mono → (H, W)
         first_cal = accepted[0][0]
-        if first_cal.ndim == 3:
-            sensor_shape = first_cal.shape[-2:]
-        else:
-            sensor_shape = first_cal.shape
+        is_osc    = (first_cal.ndim == 3)
+        osc_scale = 2 if is_osc else 1
+        sensor_shape = first_cal.shape[-2:] if is_osc else first_cal.shape
 
-        all_shifts   = [meta.shift for _, meta in accepted]
-        canvas_shape, sensor_origin = _compute_union_canvas(sensor_shape, all_shifts)
+        all_metas    = [meta for _, meta in accepted]
+        canvas_shape, sensor_origin = _compute_union_canvas(
+            sensor_shape, all_metas, osc_scale=osc_scale
+        )
 
         logger.info(
             "Union canvas: sensor=%s  canvas=%s  origin=%s  "
@@ -834,7 +853,7 @@ class BayesianAstroStacker:
         # Phase 4 outputs
         if map_result is not None:
             lambda_path = output_dir / "lambda_hr.fits"
-            map_result.save_fits(lambda_path, quality_map=stats.quality_map,
+            map_result.save_fits(lambda_path, quality_map=None,
                                  bayer_pattern=bayer)
             logger.info("Super-resolved scene saved → %s", lambda_path)
 
