@@ -3,6 +3,64 @@ map_stacker.py
 ==============
 Phase 4 — Bayesian MAP super-resolution stacker.
 
+# =============================================================================
+# TODO — Frequency-domain optimisation (next major improvement)
+# =============================================================================
+#
+# MOTIVATION
+# ----------
+# Currently θ is optimised in spatial domain:
+#   θ [sH,sW] → softplus → λ_hr → rfft2 → Θ_f → × H_i → irfft2 → downsample
+# The rfft2(λ_hr) is recomputed every iteration — it's the dominant cost on CPU.
+#
+# PROPOSAL: optimise Θ_f directly in frequency domain.
+#   Θ_f [pH, pW//2+1] complex  ← optimised variable
+#      × H_i  (precomputed)    ← elementwise, NO rfft2 needed per step
+#      irfft2 → crop → downsample → loss
+#   Only irfft2(Θ_f) at convergence to recover λ_hr spatial image.
+#
+# EXPECTED SPEEDUP
+# ----------------
+# Eliminates rfft2(λ_hr) every step → roughly halves FFT cost per step.
+# On CPU: ~8s/step → ~4s/step. On desktop GPU: even more impactful.
+#
+# IMPLEMENTATION NOTES
+# --------------------
+# 1. POSITIVITY CONSTRAINT
+#    softplus(θ) enforces λ > 0 in spatial domain. In freq domain:
+#    - Option A: clamp(irfft2(Θ_f), min=0) after each step (projected GD).
+#    - Option B: drop hard constraint, use stronger KL prior to keep λ ≥ 0.
+#    - Option C: optimise log|Θ_f| and phase separately (polar form) — complex.
+#    Recommend Option A: project after each Adam step, simple and effective.
+#
+# 2. REGULARISATION
+#    TV(λ_hr) requires spatial domain → needs irfft2 every step anyway.
+#    Replace with frequency-domain Wiener/Tikhonov prior:
+#      L_reg = alpha_wiener · Σ_{k} |k|^2 · |Θ_f(k)|^2
+#    This penalises high-frequency energy (smoothness prior). For emission
+#    nebulae this is appropriate — smooth extended structure + point stars.
+#    Avoids TV "staircase" artefact on smooth nebulosity.
+#    Keep TV as an option (requires irfft2 per step, costs one FFT back).
+#
+# 3. REAL-VALUED CONSTRAINT (Hermitian symmetry)
+#    rfft2 returns only the non-redundant half; optimising Θ_f directly
+#    in rfft2 space automatically satisfies Hermitian symmetry.
+#    Use torch.view_as_real(Θ_f) to expose real/imag to Adam.
+#
+# 4. INITIALISATION
+#    Θ_f_init = rfft2(softplus(θ_init)) — computed once from Phase 3 prior.
+#
+# 5. AFFINE WARP
+#    Rotation/scale is spatial — must be applied before FFT.
+#    For datasets with rot≈0 (equatorial mounts) this is a no-op anyway.
+#    For general case: warp lam_spatial = irfft2(Θ_f) per warp_frame — adds
+#    one irfft2 per warped frame per step. Still a net win if few frames need it.
+#
+# NEW MODE: map_mode = "freq"
+#    Add to MapConfig: mode = 'freq', alpha_wiener: float = 1e-3
+#    Implement as _solve_freq() parallel to _solve_fast() / _solve_exact().
+# =============================================================================
+
 Solves for a super-resolved scene λ on an (S·H) × (S·W) grid (S = scale_factor)
 by minimising a regularised Poisson negative log-likelihood:
 
