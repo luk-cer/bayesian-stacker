@@ -694,11 +694,13 @@ class BayesianAstroStacker:
         cfg = self.config
 
         # ── Pass 1: characterise every frame, collect metadata ─────────────
-        # Buffer (calibrated, meta) for accepted frames so Pass 2 can place
-        # them into the union canvas without re-loading from disk.
-        accepted: List[tuple] = []   # list of (calibrated_array, FrameMetadata)
+        # Store only (path, exp_s, meta) — NOT the calibrated array — to keep
+        # peak RAM to one frame at a time.  Calibrated arrays are reloaded from
+        # disk in Pass 2 (cheap: model already fitted, no star extraction).
+        accepted: List[tuple] = []   # list of (path, exp_s, FrameMetadata)
         n_rejected = 0
         is_osc_batch: Optional[bool] = None
+        first_cal_shape: Optional[tuple] = None
 
         for i, path in enumerate(light_paths):
             is_ref = (len(accepted) == 0)
@@ -718,6 +720,7 @@ class BayesianAstroStacker:
                             and meta.calibrated.ndim == 3)
             if is_osc_batch is None:
                 is_osc_batch = frame_is_osc
+                first_cal_shape = meta.calibrated.shape
                 logger.info(
                     "Batch type: %s (detected from first frame)",
                     "OSC" if is_osc_batch else "mono",
@@ -730,12 +733,11 @@ class BayesianAstroStacker:
                     f"{'OSC' if is_osc_batch else 'mono'}."
                 )
 
+            # Free the calibrated array immediately — Pass 2 will reload from disk.
             # All frames accepted — transparency and FWHM are used as weights
-            # by the MAP solver, not as hard rejection criteria.  A blurrier
-            # or dimmer frame contributes less signal automatically through its
-            # PSF kernel and transparency weight; discarding it throws away
-            # real photons.
-            accepted.append((meta.calibrated, meta))
+            # by the MAP solver, not as hard rejection criteria.
+            meta.calibrated = None
+            accepted.append((path, exp_s, meta))
             logger.info(
                 "Pass1 frame %3d/%d  t=%.3f  FWHM=%.2f\"  accepted=%d",
                 i+1, len(light_paths),
@@ -747,12 +749,11 @@ class BayesianAstroStacker:
             raise RuntimeError("No frames could be characterised.")
 
         # ── Compute union bounding box ──────────────────────────────────────
-        first_cal = accepted[0][0]
-        is_osc    = (first_cal.ndim == 3)
+        is_osc    = bool(is_osc_batch)
         osc_scale = 2 if is_osc else 1
-        sensor_shape = first_cal.shape[-2:] if is_osc else first_cal.shape
+        sensor_shape = first_cal_shape[-2:] if is_osc else first_cal_shape[:2]
 
-        all_metas    = [meta for _, meta in accepted]
+        all_metas    = [meta for _, _, meta in accepted]
         canvas_shape, sensor_origin = _compute_union_canvas(
             sensor_shape, all_metas, osc_scale=osc_scale
         )
@@ -766,10 +767,21 @@ class BayesianAstroStacker:
         )
 
         # ── Pass 2: accumulate into union canvas ────────────────────────────
+        # Reload and re-calibrate one frame at a time to keep RAM bounded.
         acc = SufficientStatsAccumulator()
         acc.set_canvas(canvas_shape, sensor_origin)
 
-        for j, (cal, meta) in enumerate(accepted):
+        for j, (fpath, exp_s, meta) in enumerate(accepted):
+            raw, _ = fc._load(fpath)
+            rot = 0.0
+            if meta.ref_wcs is not None and meta.wcs_geom is not None:
+                try:
+                    rot = float(meta.ref_wcs.position_angle_deg
+                                - meta.wcs_geom.position_angle_deg)
+                    rot = (rot + 180.0) % 360.0 - 180.0
+                except Exception:
+                    pass
+            cal = model.calibrate_frame(raw, exp_s, rotation_deg=rot)
             acc.add_calibrated(cal, meta)
 
             if (j + 1) % cfg.checkpoint_every == 0:

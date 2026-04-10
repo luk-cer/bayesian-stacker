@@ -236,7 +236,12 @@ class MapConfig:
 
     # Mode
     mode:       str  = 'fast'
-    batch_size: int  = 8
+    batch_size: int  = 8          # EXACT mode: frames per mini-batch
+
+    # Forward model mini-batch (FAST mode): number of frames to process per
+    # rfft2 call. Larger = more parallelism but more RAM. 4-8 is good for CPU;
+    # 16-32 for GPU with 8GB+; set to N to process all frames in one shot.
+    forward_batch_size: int = 8
 
     # Hardware
     device:    Optional[str] = None
@@ -715,7 +720,7 @@ def _apply_affine_grid(
 
 
 def _forward_single(
-    theta:       "torch.Tensor",   # [sH, sW]  unconstrained parameterisation
+    lam:         "torch.Tensor",   # [sH, sW]  λ_hr (already softplus-transformed)
     psf_spec:    "torch.Tensor",   # rfft2 spectrum of padded PSF
     phase_ramp:  "torch.Tensor",   # rfft2 phase ramp
     scale:       int,
@@ -727,14 +732,12 @@ def _forward_single(
     """
     Single-frame forward model in PyTorch.
 
-    θ → λ = softplus(θ) → AffineWarp(rot,scale) → PhaseShift(freq) → PSF conv → downsample → t·λ_lr
+    λ_hr → AffineWarp(rot,scale) → PhaseShift(freq) → PSF conv → downsample → t·λ_lr
 
+    Caller is responsible for the softplus(theta) → lam transform.
     Rotation+scale are applied spatially (grid_sample) before the FFT.
     Translation remains in frequency domain (phase ramp) — exact and alias-free.
     """
-    # Reparameterisation: ensure λ > 0
-    lam = F.softplus(theta)                                   # [sH, sW]
-
     # Rotation + scale warp (spatial, before FFT).  No-op when affine_grid is None.
     lam = _apply_affine_grid(lam, affine_grid)                # [sH, sW]
 
@@ -960,23 +963,37 @@ def _solve_fast(
     pW = _next_power_of_2(sW + psf_max)
 
     # ---- Per-frame caches (precomputed once, before the optimisation loop) -
-    psf_specs: List["torch.Tensor"]   = []
-    phase_ramps: List["torch.Tensor"] = []
-    affine_grids: List               = []
-    t_list: List[float]               = stats.transparency_list
+    # Batch PSF spectra and phase ramps as [N, pH, pW//2+1] tensors so the
+    # entire forward model is a single batched rfft2 — no Python loop at all.
+    t_list: List[float] = stats.transparency_list
+    t_sq = torch.tensor([t*t for t in t_list], dtype=torch.float32, device=dev)  # [N]
+
+    psf_stack  = []
+    ramp_stack = []
+    affine_grids: List = []
 
     for i in range(N):
         psf_i = stats.psf_list[i].astype(np.float32)
         psf_i /= psf_i.sum()
-        psf_specs.append(_make_psf_spectrum(psf_i, pH, pW, dev))
+        psf_stack.append(_make_psf_spectrum(psf_i, pH, pW, dev))   # [pH, pW//2+1]
 
         sh = stats.shift_list[i]
-        dx_i = sh.dx_px       if sh is not None else 0.0
-        dy_i = sh.dy_px       if sh is not None else 0.0
+        dx_i  = sh.dx_px       if sh is not None else 0.0
+        dy_i  = sh.dy_px       if sh is not None else 0.0
         rot_i = -(sh.rotation_deg  if sh is not None else 0.0)
         sc_i  = 1.0 / (sh.scale_ratio if (sh is not None and sh.scale_ratio > 0) else 1.0)
-        phase_ramps.append(_build_phase_ramp(dx_i, dy_i, pH, pW, S, dev))
+        ramp_stack.append(_build_phase_ramp(dx_i, dy_i, pH, pW, S, dev))
         affine_grids.append(_build_affine_grid(rot_i, sc_i, sH, sW, dev))
+
+    # [N, pH, pW//2+1] — combined filter H_i = PSF_i × PhaseRamp_i
+    # Precomputed once; reused every optimisation step.
+    # Per step we only need: rfft2(lam_hr_warped_i) × H_i
+    psf_batch  = torch.stack(psf_stack,  dim=0)   # complex64 [N, pH, pW//2+1]
+    ramp_batch = torch.stack(ramp_stack, dim=0)   # complex64 [N, pH, pW//2+1]
+    H_batch    = psf_batch * ramp_batch            # combined filter — ONE multiply, done once
+
+    # Frames that need spatial affine warp (rotation/scale != identity)
+    warp_indices = [i for i, g in enumerate(affine_grids) if g is not None]
 
     # ---- Initialise λ on HR grid -------------------------------------------
     prior_hr = _build_prior(stats.weighted_mean, S)          # [sH, sW]
@@ -1005,14 +1022,42 @@ def _solve_fast(
 
         lam_hr   = F.softplus(theta)                                # [sH, sW]
 
-        # Per-frame forward model: Σ t_i² · D(PSF_i ⊛ AffineWarp_i(PhaseShift_i(λ_hr)))
+        # Mini-batched forward model: process config.forward_batch_size frames
+        # at a time, accumulate predicted_sum. Keeps peak RAM to
+        # batch_size × FFT_tensor_size regardless of total N.
         predicted_sum = torch.zeros_like(obs_t)
-        for i in range(N):
-            t_i = t_list[i]
-            predicted_sum = predicted_sum + t_i * t_i * _forward_single(
-                theta, psf_specs[i], phase_ramps[i], S, 1.0, pH, pW,
-                affine_grid=affine_grids[i],
-            )
+        bs = config.forward_batch_size
+        for b_start in range(0, N, bs):
+            b_end = min(b_start + bs, N)
+            idx   = list(range(b_start, b_end))
+            B     = len(idx)
+
+            # Build [B, sH, sW] — apply affine warp where needed
+            frames = []
+            for i in idx:
+                f = _apply_affine_grid(lam_hr, affine_grids[i]) if affine_grids[i] is not None else lam_hr
+                frames.append(f)
+            lam_batch = torch.stack(frames, dim=0)              # [B, sH, sW]
+
+            # Pad + rfft2 — one batched call
+            lam_padded = F.pad(
+                lam_batch.unsqueeze(1),                         # [B, 1, sH, sW]
+                (0, pW - sW, 0, pH - sH),
+                mode='reflect',
+            ).squeeze(1)                                         # [B, pH, pW]
+            lam_f = torch.fft.rfft2(lam_padded)                 # [B, pH, pW//2+1]
+
+            # Phase-shift + PSF conv — single multiply with precomputed H_i
+            lam_f = lam_f * H_batch[b_start:b_end]
+
+            # irfft2, crop, downsample, weight and accumulate
+            lam_conv = torch.fft.irfft2(lam_f, s=(pH, pW))[:, :sH, :sW]   # [B, sH, sW]
+            lam_lr   = F.avg_pool2d(
+                lam_conv.unsqueeze(1), kernel_size=S, stride=S,
+            ).squeeze(1)                                         # [B, H, W]
+            lam_lr   = torch.clamp(lam_lr, min=0.0)
+
+            predicted_sum = predicted_sum + (t_sq[b_start:b_end, None, None] * lam_lr).sum(dim=0)
 
         # ---- Data loss
         loss = _poisson_nll_torch(obs_t, predicted_sum)
@@ -1164,7 +1209,7 @@ def _solve_exact(
 
             # Forward model
             lam_lr = _forward_single(
-                theta, psf_specs[i], phase_ramps[i], S, t_i, pH, pW,
+                lam_hr_cur, psf_specs[i], phase_ramps[i], S, t_i, pH, pW,
                 affine_grid=affine_grids[i],
             )
 

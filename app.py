@@ -1,3 +1,10 @@
+import logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-7s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+
 from bayesian_astro_stacker import BayesianAstroStacker, PipelineConfig
 
 cfg = PipelineConfig(
@@ -9,7 +16,7 @@ cfg = PipelineConfig(
     # MAP solver
     scale_factor    = 2,
     map_mode        = "fast",       # "fast" (default) or "exact"
-    map_n_iter      = 500,          # increased — previous run hit 300 without converging
+    map_n_iter      = 10,
     map_alpha_tv    = 5e-4,
     map_alpha_kl    = 0.0,
     map_alpha_wav   = 0.0,
